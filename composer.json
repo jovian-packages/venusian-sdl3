@@ -1,9 +1,9 @@
 {
     "name": "jovian/venusian-sdl3",
-    "description": "SDL3 composition layer for Venusian Surface: the sdl3 stage host and the sdl3 GPU engine",
+    "description": "SDL3 composition layer for Venusian Surface: the sdl3 stage host, the sdl3 GPU engine and the sdl3 input engine",
     "type": "library",
     "version": "0.8.0",
-    "keywords": ["framework", "venusian", "sdl3", "gpu", "stage"],
+    "keywords": ["framework", "venusian", "sdl3", "gpu", "stage", "input"],
     "license": "MIT",
     "authors": [
         {
@@ -16,6 +16,7 @@
         "jovian/sdl3": "^0.8.0",
         "surface/contracts": "^0.8.0",
         "surface/drawing": "^0.8.0",
+        "surface/human-input": "^0.8.0",
         "surface/stage": "^0.8.0",
         "venusian/surface": "^0.8.0",
         "venusian-voyager/contracts": "^0.8.0",
@@ -53,7 +54,7 @@
         "allow-plugins": { "pestphp/pest-plugin": true }
     },
     "extra": {
-        "branch-alias": { "dev-master": "0.8.x-dev" },
+        "branch-alias": { "dev-main": "0.8.x-dev" },
         "venusian": {
             "providers": ["Jovian\\Venusian\\Sdl3\\Providers\\VenusianSdl3ServiceProvider"],
             "aliases": {}

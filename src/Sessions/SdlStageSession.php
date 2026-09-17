@@ -12,6 +12,7 @@ use Jovian\Bindings\Sdl3\SDL;
 use Jovian\Bindings\Sdl3\SDLError;
 use Jovian\Bindings\Sdl3\Video\SDLVideo;
 use Jovian\Venusian\Sdl3\Contracts\LendsToEngine;
+use Jovian\Venusian\Sdl3\Events\SdlEventPump;
 use Jovian\Venusian\Sdl3\Exceptions\Sdl3StageException;
 use Jovian\Venusian\Sdl3\Stages\SdlStagedWindow;
 use Jovian\Venusian\Sdl3\Surfaces\SdlGLSurface;
@@ -30,14 +31,17 @@ use Surface\Stage\StageSession;
  * drains SDL's queue without waiting (the os resource owns the tick's idle
  * wait), routes window events to their stage by window id, and frees every
  * event it does not read — a reader frees the event it decodes. Input events
- * are dropped unread until Surface\HumanInput exists. Every mint failure
- * is a StageException: an engine's own attach() failure is wrapped as
- * Sdl3StageException::attachFailed, the engine's exception as previous.
+ * belong to the SdlEventPump: buffered for the sdl3 input engine when it is
+ * connected, freed otherwise. Every mint failure is a StageException: an
+ * engine's own attach() failure is wrapped as Sdl3StageException::attachFailed,
+ * the engine's exception as previous.
  */
 final class SdlStageSession extends StageSession
 {
     /** @var array<int, SdlStagedWindow> keyed by SDL window id */
     private array $stages = [];
+
+    public function __construct(private readonly SdlEventPump $pump = new SdlEventPump()) {}
 
     public function host(): StageHost
     {
@@ -49,6 +53,29 @@ final class SdlStageSession extends StageSession
         return false;
     }
 
+    /**
+     * On macOS SDL reads keys only inside its own pump, so another NSApp drain
+     * (the os resource's) would eat them. SDL forwards every event to AppKit,
+     * so native windows keep working while SDL owns the queue.
+     */
+    public function ownsNativePump(): bool
+    {
+        return PHP_OS_FAMILY === 'Darwin';
+    }
+
+    /** @return array<int, int> SDL window id → SDL window handle, open stages only */
+    public function windowHandles(): array
+    {
+        $open = array_filter($this->stages, static fn (SdlStagedWindow $stage): bool => $stage->isOpen());   // a closed stage's window is destroyed before the next pump drops it
+
+        return array_map(static fn (SdlStagedWindow $stage): int => $stage->window, $open);
+    }
+
+    public function windowName(int $window_id): ?string
+    {
+        return ($this->stages[$window_id] ?? null)?->name();
+    }
+
     protected function initializeEngine(): void
     {
         if (! SDL::SDLInit(SDLInitFlags::VIDEO->value)) {
@@ -56,7 +83,10 @@ final class SdlStageSession extends StageSession
         }
     }
 
-    protected function connectToEngine(): void {}
+    protected function connectToEngine(): void
+    {
+        $this->pump->routeWindowsTo($this->route(...));
+    }
 
     /** Closes every stage; a close that throws does not spare the rest. The first failure is rethrown. */
     protected function disconnectEngine(): void
@@ -79,11 +109,7 @@ final class SdlStageSession extends StageSession
 
     protected function pumpEngine(int $budget_ms): int
     {
-        $count = 0;
-        while (! is_null($event = SDLEvents::SDLPollEvent())) {
-            $count++;
-            $this->route((int) $event['ptr'], (int) $event['event_type']);
-        }
+        $count = $this->pump->drain($this->ownsNativePump() ? $budget_ms : 0);
 
         $this->stages = array_filter($this->stages, fn (SdlStagedWindow $stage) => $stage->isOpen());
 
@@ -152,12 +178,6 @@ final class SdlStageSession extends StageSession
             foreach ($this->stages as $stage) {
                 $stage->closeRequested();
             }
-
-            return;
-        }
-
-        if ($type < SDLEventType::WINDOW_SHOWN->value || $type > SDLEventType::WINDOW_HDR_STATE_CHANGED->value) {
-            SDLEvents::SDLFreeEvent($ptr);
 
             return;
         }
