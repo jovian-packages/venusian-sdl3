@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Jovian\Venusian\Sdl3\Support;
 
 use Jovian\Bindings\Sdl3\Enums\SDLGPUTextureFormat;
+use Jovian\Bindings\Sdl3\Enums\SDLPixelFormat;
 
 /** Readback byte order: the offscreen target shares the swapchain's format, and Surface wants RGBA8. */
 final class Pixels
@@ -24,5 +25,16 @@ final class Pixels
         }
 
         return $rgba;
+    }
+
+    /**
+     * The SDL format whose bytes in memory are R, G, B, A — what
+     * CPUDrawTarget::rgba8() hands us. SDL names 32-bit formats by packed
+     * value, so the byte order flips with the host: ABGR8888 is RGBA32 on a
+     * little-endian box, RGBA8888 on a big-endian one.
+     */
+    public static function rgba32(): SDLPixelFormat
+    {
+        return unpack('S', "\x01\x00")[1] === 1 ? SDLPixelFormat::ABGR8888 : SDLPixelFormat::RGBA8888;
     }
 }

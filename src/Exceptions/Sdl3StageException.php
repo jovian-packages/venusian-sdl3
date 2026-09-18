@@ -22,4 +22,14 @@ final class Sdl3StageException extends StageException
     {
         return new self("SDL could not lend a {$what}: {$reason}");
     }
+
+    public static function rendererFailed(string $name, string $reason): self
+    {
+        return new self("SDL could not create a renderer for the '{$name}' stage: {$reason}");
+    }
+
+    public static function textureFailed(string $name, int $width, int $height, string $reason): self
+    {
+        return new self("SDL could not create a {$width}x{$height} streaming texture for the '{$name}' stage: {$reason}");
+    }
 }

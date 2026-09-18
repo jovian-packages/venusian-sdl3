@@ -18,6 +18,17 @@ $stage = Stage::open('main', 'sdl3', 1024, 640, 'sdl3')   // engine, then host
     ->show();                                            // stages are minted hidden
 ```
 
+## Host
+
+`SdlStageSession` (`stage.sdl3`) mints both kinds. The provider passes `config('stage.cpu_renderer', 'software')` (`STAGE_CPU_RENDERER`) into the session; `null` lets SDL pick a renderer.
+
+| Kind | Session verb | Window | Present |
+|---|---|---|---|
+| GPU | `open` / `mintStage` | `SdlStagedWindow` | executor into a lent layer (HOST_WINDOW / GL / Metal / Vulkan) |
+| CPU | `openCPU` / `mintCPUStage` | `SdlCPUStagedWindow` | canvas `rgba8()` — software renderer, streaming RGBA32 texture, `StageFit` + `NEAREST` |
+
+Both implement `RoutableStage` so the pump routes by window id. CPU flags are `RESIZABLE | HIGH_PIXEL_DENSITY | HIDDEN` with no GL / Metal / Vulkan. Canvas size is fixed; a resize rescales.
+
 ## Input
 
 `input.sdl3` (Surface's default input engine) reads keyboard, text and mouse for sdl3 stage windows, and gamepads on every OS with no SDL window needed. Keys are layout-independent scancodes. Every SDL gamepad is a game controller, id `sdl3-<instance_id>`. The dock polls the engine each tick; a sketch only reads.

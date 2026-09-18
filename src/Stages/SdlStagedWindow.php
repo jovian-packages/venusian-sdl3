@@ -6,12 +6,13 @@ namespace Jovian\Venusian\Sdl3\Stages;
 
 use Jovian\Bindings\Sdl3\Video\SDLVideo;
 use Jovian\Venusian\Sdl3\Contracts\LendsToEngine;
+use Jovian\Venusian\Sdl3\Contracts\RoutableStage;
 use Surface\Contracts\Drawing\Executor;
 use Surface\Contracts\Drawing\GPUEngine;
 use Surface\Stage\StagedWindow;
 
 /** A stage over an SDL window. What the window lent the engine is released after the executor, before the window. */
-final class SdlStagedWindow extends StagedWindow
+final class SdlStagedWindow extends StagedWindow implements RoutableStage
 {
     public function __construct(
         string $name,
@@ -24,6 +25,11 @@ final class SdlStagedWindow extends StagedWindow
         private readonly ?LendsToEngine $lent = null,
     ) {
         parent::__construct($name, $engine, $executor, $width, $height, $scale);
+    }
+
+    public function window(): int
+    {
+        return $this->window;
     }
 
     /** SDL's pixel density for the window; pixels over points when SDL cannot say. */

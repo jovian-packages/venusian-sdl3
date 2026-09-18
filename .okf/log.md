@@ -1,5 +1,10 @@
 # Update Log
 
+## 2026-09-17 (CPU stages)
+* **Update**: [session](/session.md) — `mintCPUStage` mints `SdlCPUStagedWindow` (software renderer from `STAGE_CPU_RENDERER` / `stage.cpu_renderer`, streaming texture, `Fits` / `Pixels::rgba32`, `NEAREST`). `RoutableStage` is the pump's type. Host table gains the CPU row. Close order: texture → renderer → window.
+* **Update**: [index](/index.md) — opening names CPU stages.
+* **Tests**: Mac 67 passed (2 Linux-only skips) including both CPU feature tests; Pi fnk0107 67 passed (2 macOS-only skips) on `DISPLAY=:0` `SDL_VIDEODRIVER=x11` (this SDL build has no Wayland driver). Eyeball: 128×64 mono at 4× and 320×200 `nframes` in 960×600, `INTEGER_SCALE` + `NEAREST`, canvas size unchanged on resize.
+
 ## 2026-09-17
 * **Fix**: `Sdl3InputEngine` wheel negates x/y when `direction` = SDL_MOUSEWHEEL_FLIPPED (1).
 * **Fix**: `Mouse::window()` set at the end of each `poll()` from `SDL_GetMouseFocus()` → stage name, null for no focus / no stage; x/y kept. Constructor takes `mouse_focus` Closure.

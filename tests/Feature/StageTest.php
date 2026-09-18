@@ -3,29 +3,12 @@
 declare(strict_types=1);
 
 use Jovian\Venusian\Sdl3\Exceptions\Sdl3StageException;
-use Jovian\Venusian\Sdl3\Sessions\SdlStageSession;
 use Jovian\Venusian\Sdl3\Stages\SdlStagedWindow;
 use Jovian\Venusian\Sdl3\Surfaces\SdlGLSurface;
 use Surface\Contracts\Drawing\GPUEngine;
 use Surface\Contracts\Drawing\SurfaceKind;
 use Surface\Contracts\Stage\StageException;
 use Venusian\Tests\Support\StubEngine;
-
-function connectedSdlSession(): SdlStageSession
-{
-    if (! sdl3ExtensionLoaded()) {
-        test()->markTestSkipped('ext-sdl3 is not loaded');
-    }
-
-    $session = new SdlStageSession();
-    try {
-        $session->connect();
-    } catch (Sdl3StageException $e) {
-        test()->markTestSkipped($e->getMessage());
-    }
-
-    return $session;
-}
 
 it('opens a hidden HOST_WINDOW stage, pumps, and closes it terminally', function () {
     $session = connectedSdlSession();

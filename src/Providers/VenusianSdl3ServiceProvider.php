@@ -16,7 +16,10 @@ class VenusianSdl3ServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->singleton(SdlEventPump::class);
-        $this->app->singleton(SdlStageSession::class, fn ($app) => new SdlStageSession($app->make(SdlEventPump::class)));
+        $this->app->singleton(SdlStageSession::class, fn ($app) => new SdlStageSession(
+            $app->make(SdlEventPump::class),
+            $app->make('config')->get('stage.cpu_renderer', 'software'),
+        ));
         $this->app->alias(SdlStageSession::class, 'stage.sdl3');
         $this->app->singleton(Sdl3GpuEngine::class);
         $this->app->alias(Sdl3GpuEngine::class, 'gpu.sdl3');

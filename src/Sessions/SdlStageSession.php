@@ -6,23 +6,34 @@ namespace Jovian\Venusian\Sdl3\Sessions;
 
 use Jovian\Bindings\Sdl3\Enums\SDLEventType;
 use Jovian\Bindings\Sdl3\Enums\SDLInitFlags;
+use Jovian\Bindings\Sdl3\Enums\SDLScaleMode;
+use Jovian\Bindings\Sdl3\Enums\SDLTextureAccess;
 use Jovian\Bindings\Sdl3\Enums\SDLWindowFlags;
 use Jovian\Bindings\Sdl3\Events\SDLEvents;
+use Jovian\Bindings\Sdl3\Render\SDLRender;
 use Jovian\Bindings\Sdl3\SDL;
 use Jovian\Bindings\Sdl3\SDLError;
 use Jovian\Bindings\Sdl3\Video\SDLVideo;
 use Jovian\Venusian\Sdl3\Contracts\LendsToEngine;
+use Jovian\Venusian\Sdl3\Contracts\RoutableStage;
 use Jovian\Venusian\Sdl3\Events\SdlEventPump;
 use Jovian\Venusian\Sdl3\Exceptions\Sdl3StageException;
+use Jovian\Venusian\Sdl3\Stages\SdlCPUStagedWindow;
 use Jovian\Venusian\Sdl3\Stages\SdlStagedWindow;
+use Jovian\Venusian\Sdl3\Support\Fits;
+use Jovian\Venusian\Sdl3\Support\Pixels;
 use Jovian\Venusian\Sdl3\Surfaces\SdlGLSurface;
 use Jovian\Venusian\Sdl3\Surfaces\SdlMetalView;
 use Jovian\Venusian\Sdl3\Surfaces\SdlVulkanSurface;
+use Surface\Contracts\Drawing\CPUEngineDriver;
+use Surface\Contracts\Drawing\CPUHost;
 use Surface\Contracts\Drawing\GPUEngineDriver;
 use Surface\Contracts\Drawing\GPUHost;
 use Surface\Contracts\Drawing\SurfaceKind;
 use Surface\Contracts\Stage\StageException;
+use Surface\Contracts\Stage\StageFit;
 use Surface\Contracts\Stage\StageHost;
+use Surface\Stage\CPUStagedWindow;
 use Surface\Stage\StagedWindow;
 use Surface\Stage\StageSession;
 
@@ -38,10 +49,13 @@ use Surface\Stage\StageSession;
  */
 final class SdlStageSession extends StageSession
 {
-    /** @var array<int, SdlStagedWindow> keyed by SDL window id */
+    /** @var array<int, RoutableStage> keyed by SDL window id */
     private array $stages = [];
 
-    public function __construct(private readonly SdlEventPump $pump = new SdlEventPump()) {}
+    public function __construct(
+        private readonly SdlEventPump $pump = new SdlEventPump(),
+        private readonly ?string $renderer_name = 'software',
+    ) {}
 
     public function host(): StageHost
     {
@@ -66,9 +80,9 @@ final class SdlStageSession extends StageSession
     /** @return array<int, int> SDL window id → SDL window handle, open stages only */
     public function windowHandles(): array
     {
-        $open = array_filter($this->stages, static fn (SdlStagedWindow $stage): bool => $stage->isOpen());   // a closed stage's window is destroyed before the next pump drops it
+        $open = array_filter($this->stages, static fn (RoutableStage $stage): bool => $stage->isOpen());   // a closed stage's window is destroyed before the next pump drops it
 
-        return array_map(static fn (SdlStagedWindow $stage): int => $stage->window, $open);
+        return array_map(static fn (RoutableStage $stage): int => $stage->window(), $open);
     }
 
     public function windowName(int $window_id): ?string
@@ -111,7 +125,7 @@ final class SdlStageSession extends StageSession
     {
         $count = $this->pump->drain($this->ownsNativePump() ? $budget_ms : 0);
 
-        $this->stages = array_filter($this->stages, fn (SdlStagedWindow $stage) => $stage->isOpen());
+        $this->stages = array_filter($this->stages, fn (RoutableStage $stage) => $stage->isOpen());
 
         return $count;
     }
@@ -169,6 +183,73 @@ final class SdlStageSession extends StageSession
         $stage = new SdlStagedWindow($name, $engine->engine(), $attachment->executor, $width, $height, $scale, $window, $lent);
 
         return $this->stages[SDLVideo::SDLGetWindowID($window)] = $stage;
+    }
+
+    protected function mintCPUStage(string $name, CPUEngineDriver $engine, CPUHost $canvas, int $width, int $height, StageFit $fit): CPUStagedWindow
+    {
+        try {
+            $window = SDLVideo::SDLCreateWindow($name, $width, $height, $this->cpuFlags());
+        } catch (\RuntimeException $e) {
+            throw Sdl3StageException::windowFailed($name, $e->getMessage());
+        }
+
+        $renderer = 0;
+        $texture = 0;
+
+        try {
+            $renderer = is_null($this->renderer_name)
+                ? SDLRender::SDLCreateRenderer($window)                       // SDL picks; the projection slices by func_num_args()
+                : SDLRender::SDLCreateRenderer($window, $this->renderer_name);
+            if ($renderer === 0) {
+                throw Sdl3StageException::rendererFailed($name, SDLError::SDLGetError());
+            }
+
+            $created = SDLRender::SDLCreateTexture($renderer, Pixels::rgba32(), SDLTextureAccess::STREAMING, $canvas->width, $canvas->height);
+            if ($created === []) {
+                throw Sdl3StageException::textureFailed($name, $canvas->width, $canvas->height, SDLError::SDLGetError());
+            }
+            $texture = (int) $created['ptr'];
+
+            SDLRender::SDLSetTextureScaleMode($texture, SDLScaleMode::NEAREST);
+            SDLRender::SDLSetRenderLogicalPresentation($renderer, $canvas->width, $canvas->height, Fits::of($fit));
+
+            [$points_wide, $points_high] = SDLVideo::SDLGetWindowSize($window);
+            $points_wide = (int) $points_wide;
+            $target = $engine->attach($canvas);
+        } catch (\Throwable $e) {
+            if ($texture !== 0) {
+                SDLRender::SDLDestroyTexture($texture);
+            }
+            if ($renderer !== 0) {
+                SDLRender::SDLDestroyRenderer($renderer);
+            }
+            SDLVideo::SDLDestroyWindow($window);
+
+            throw $e;
+        }
+
+        $stage = new SdlCPUStagedWindow(
+            $name,
+            $target,
+            $points_wide,
+            (int) $points_high,
+            SdlStagedWindow::densityOf($window, $points_wide),
+            $fit,
+            $window,
+            $renderer,
+            $texture,
+            $canvas->width * 4,
+        );
+
+        return $this->stages[SDLVideo::SDLGetWindowID($window)] = $stage;
+    }
+
+    /** A CPU stage needs no GL, Metal or Vulkan flag — SDL's renderer owns the window. */
+    private function cpuFlags(): int
+    {
+        return SDLWindowFlags::RESIZABLE->value
+            | SDLWindowFlags::HIGH_PIXEL_DENSITY->value
+            | SDLWindowFlags::HIDDEN->value;
     }
 
     private function route(int $ptr, int $type): void

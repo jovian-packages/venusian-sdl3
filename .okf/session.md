@@ -5,11 +5,11 @@ description: >-
   SdlStageSession mints whole SDL windows an engine owns, lends each engine
   what its surface kind needs, and pumps SDL's queue on its own.
 resource: src/Sessions/SdlStageSession.php
-tags: [sdl3, stage, host, gl, metal, vulkan, lender]
+tags: [sdl3, stage, host, gl, metal, vulkan, lender, cpu]
 status: draft
 generated:
-  by: claude-opus-5/claude-code
-  at: "2026-09-17T12:00:00Z"
+  by: cursor-grok-4.6/cursor
+  at: "2026-09-18T04:45:00Z"
 sources:
   - id: stage
     resource: ../../venusian/surface/.okf/stage.md
@@ -17,11 +17,17 @@ sources:
   - id: events
     resource: ../../php-io-extensions/sdl3/.okf/api/events.md
     title: ext-sdl3 events — PollEvent, ReadEvent, free rule
+  - id: cpu
+    resource: src/Stages/SdlCPUStagedWindow.php
+    title: SdlCPUStagedWindow
+  - id: route
+    resource: src/Contracts/RoutableStage.php
+    title: RoutableStage
 ---
 
 # Overview
 
-Alias `stage.sdl3` → `SdlStageSession` (singleton). Fills `Surface\Stage\StageSession`; stages are `SdlStagedWindow` over `Surface\Stage\StagedWindow`.[^stage]
+Alias `stage.sdl3` → `SdlStageSession` (singleton). Fills `Surface\Stage\StageSession`. GPU stages are `SdlStagedWindow` over `Surface\Stage\StagedWindow`; CPU stages are `SdlCPUStagedWindow` over `Surface\Stage\CPUStagedWindow`. Both implement package-local `RoutableStage` (`name`, `window()`, `windowId`, `isOpen`, `nativeResized`, `closeRequested`) so `route()` and `windowHandles()` never name a concrete class. The public readonly `$window` stays on the GPU class — GPU feature tests read the property; `windowHandles()` calls `window()`.[^stage]
 
 # Lifecycle
 
@@ -57,6 +63,22 @@ Window flags: `RESIZABLE | HIGH_PIXEL_DENSITY | HIDDEN` plus one per kind. Host 
 - Vulkan list returned untouched, SDL's order. Engine calls `destroySurface()` exactly once, after its swapchain; host never destroys the surface. `release()` no-op.
 - Attach failure → lend released (its own throw swallowed), window destroyed in `finally`, then rethrown as `Sdl3StageException::attachFailed` (host + engine named, engine exception as previous). A `StageException` passes through unwrapped. Every mint failure is a `StageException`.
 
+## CPU — `mintCPUStage()`
+
+Constructor takes `?string $renderer_name = 'software'`. The provider passes `config('stage.cpu_renderer', 'software')` (`STAGE_CPU_RENDERER`). `null` is `SDLCreateRenderer($window)` with one argument so SDL picks.
+
+Flags: `RESIZABLE | HIGH_PIXEL_DENSITY | HIDDEN` — no GL / Metal / Vulkan.
+
+One streaming texture at **canvas** size, `Pixels::rgba32()` (little-endian `ABGR8888`, else `RGBA8888` — memory order R,G,B,A). Scale mode `NEAREST`. Logical presentation `Fits::of($fit)` at canvas size. Pitch = `$canvas->width * 4`. `[]` from `SDLCreateTexture` is `Sdl3StageException::textureFailed`. Texture / renderer / window roll back on any native failure; a PHP `attach()` exception is not wrapped.
+
+`applyPresent`: update texture → black clear → blit → present. `nativeResized` re-reads points + density — it does not remint the texture. `releaseEngine` destroys texture then renderer (idempotent, zeros the handles) before `destroyNative` kills the window.
+
+| Kind | Flag | What it presents |
+|---|---|---|
+| GPU (`open` / `mintStage`) | per surface kind above | executor into a lent layer |
+| CPU (`openCPU` / `mintCPUStage`) | no GPU flag | canvas `rgba8()` through a software renderer |
+
 # Close order
 
-`close()`: executor release → lend `release()` (GL context / Metal view) → `SDL_DestroyWindow`. Window destroy in `finally`.
+GPU `close()`: executor release → lend `release()` (GL context / Metal view) → `SDL_DestroyWindow`. Window destroy in `finally`.
+CPU `close()`: texture → renderer → window.
