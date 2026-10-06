@@ -1,22 +1,8 @@
-# Agent guidelines — jovian/venusian-sdl3
+# AGENTS.md
 
-## Knowledge Bundle (OKF)
-
-This package ships an Open Knowledge Format bundle at [`.okf/`](.okf/) (excluded from the Composer dist). Read [`.okf/index.md`](.okf/index.md) first; update the affected concept and append [`.okf/log.md`](.okf/log.md) when you learn something durable; new or changed concepts stay `status: draft`.
-
-## Where this package sits
-
-`ext-sdl3` (1:1 binding) → `jovian/sdl3` (typed projection) → **`jovian/venusian-sdl3`** (composition: the `sdl3` stage host and the `sdl3` GPU engine) → `venusian/surface`.
-
-## Rules
-
-- The provider binds `stage.sdl3` (`SdlStageSession`) and `gpu.sdl3` (`Sdl3GpuEngine`). Do not rename them.
-- Never import an AppKit, Metal, Vulkan, OpenGL or GTK symbol. What SDL lends another engine (a CAMetalLayer, a VkSurfaceKHR, a GL context) crosses as pointer bits or a Surface contract through `GPUHost`.
-- Every `SDLReadEvent` reader frees its event. Never call `SDLFreeEvent` after `SDLReadEvent`.
-- ext-sdl3 creators throw `RuntimeException`. Catch at this package's boundary and rethrow `Sdl3StageException` / `Sdl3DrawingException`.
-- The SDL_GPU frame command buffer records nothing until `endFrame()` (offscreen target + blit; see `.okf`).
-- `PHP_OS_FAMILY` may be read here (composition chooses); never in `jovian/sdl3`.
-
-## Verification
-
-`vendor/bin/pest` — Feature suites skip without ext-sdl3 or a video device; run them on a GUI session (Mac) and the Pi seat. A skipped test is not evidence.
+1. Bindings are ext-sdl3's, 1:1. This package holds the engine, never SDL calls of its own beyond SDL_GPU through ext-sdl3.
+2. Every shader change keeps Velvet's arithmetic, in both the GLSL and the MSL. A `.vert` / `.frag` change is recompiled with `glslangValidator -V -g` (in `resources/shaders`) and committed with its `.spv`. See [.okf/architecture/engine.md](.okf/architecture/engine.md).
+3. The parity suite is the gate, on the Mac and the Pi: `tests/ParityTest.php` through Surface's `GpuParity`.
+4. No toolkit code here. Window lending lives in the toolkit packages.
+5. Tests run on the GPU, never skipped; on the Pi, inside the Wayland session.
+6. Publish prep is part of done: README examples run, `.okf` validated.

@@ -1,31 +1,65 @@
 <?php
 
-declare(strict_types=1);
+namespace Jovian\Engines\Sdl3\Providers;
 
-namespace Jovian\Venusian\Sdl3\Providers;
-
-use Jovian\Venusian\Sdl3\Events\SdlEventPump;
-use Jovian\Venusian\Sdl3\Input\Sdl3InputEngine;
-use Jovian\Venusian\Sdl3\Sdl3GpuEngine;
-use Jovian\Venusian\Sdl3\Sessions\SdlStageSession;
+use Jovian\Engines\Sdl3\Sdl3Device;
+use NSApplication;
+use ObjCDelegate;
+use Surface\Contracts\Drawing\DrawingException;
+use Surface\Drawing\DrawingManager;
+use Surface\Drawing\Gpu\GpuRenderingEngine;
 use Voyager\NutsAndBolts\ServiceProvider;
 
-/** Publishes the SDL stage host, the SDL_GPU engine and the SDL input engine under the aliases Surface looks for. Installing this package is the whole enablement. */
+/**
+ * Registers the 'sdl3' engine with the drawing manager: each renderer() call
+ * builds a new engine over a new Sdl3Device from the shared arguments.
+ *
+ * The creator brings SDL's video subsystem up (SDL_InitSubSystem,
+ * reference-counted) before the device; it never quits it, since the process
+ * may hold SDL windows of its own. On macOS with ext-appkit, the application
+ * and its delegate come first, so SDL takes neither.
+ */
 class VenusianSdl3ServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        $this->app->singleton(SdlEventPump::class);
-        $this->app->singleton(SdlStageSession::class, fn ($app) => new SdlStageSession(
-            $app->make(SdlEventPump::class),
-            $app->make('config')->get('stage.cpu_renderer', 'software'),
-        ));
-        $this->app->alias(SdlStageSession::class, 'stage.sdl3');
-        $this->app->singleton(Sdl3GpuEngine::class);
-        $this->app->alias(Sdl3GpuEngine::class, 'gpu.sdl3');
-        $this->app->singleton(Sdl3InputEngine::class, fn ($app) => new Sdl3InputEngine($app->make(SdlEventPump::class), $app->make(SdlStageSession::class)));
-        $this->app->alias(Sdl3InputEngine::class, 'input.sdl3');
+
     }
 
-    public function boot(): void {}
+    public function boot(): void
+    {
+        self::extend($this->app->get('drawing'));
+    }
+
+    /**
+     * On macOS with ext-appkit, the application exists, with a delegate, before SDL video does:
+     * with no NSApp, SDL makes its own (a Dock icon, its own menus); with no delegate, it makes
+     * itself the delegate and the URL event handler. The delegate set here is a trampoline that
+     * answers no selector, so AppKit behaves as with none.
+     */
+    private static function applicationFirst(): void
+    {
+        static $delegate = null;
+        if (PHP_OS_FAMILY !== 'Darwin' || ! class_exists(NSApplication::class)) {
+            return;
+        }
+        $application = NSApplication::sharedApplication();
+        if (is_null($application->delegate())) {
+            $delegate = new ObjCDelegate('NSApplicationDelegate');
+            $application->setDelegate($delegate);
+        }
+    }
+
+    /** The engine's creator, on any drawing manager. */
+    public static function extend(DrawingManager $drawing): void
+    {
+        $drawing->extend('sdl3', function (array $args, DrawingManager $drawing): GpuRenderingEngine {
+            self::applicationFirst();
+            if (! SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+                throw new DrawingException('sdl3: SDL video could not start: '.SDL_GetError());
+            }
+
+            return GpuRenderingEngine::from(new Sdl3Device, $args, $drawing);
+        });
+    }
 }

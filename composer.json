@@ -1,10 +1,24 @@
 {
     "name": "jovian/venusian-sdl3",
-    "description": "SDL3 composition layer for Venusian Surface: the sdl3 stage host, the sdl3 GPU engine and the sdl3 input engine",
+    "description": "The 'sdl3' rendering engine for Venusian Surface: a GpuDevice over ext-sdl3's SDL_GPU that draws Surface's draw lists on the GPU, on macOS and Linux, and presents into an SDL window.",
     "type": "library",
-    "version": "0.8.0",
-    "keywords": ["framework", "venusian", "sdl3", "gpu", "stage", "input"],
+    "keywords": [
+        "framework",
+        "venusian",
+        "surface",
+        "drawing",
+        "gpu",
+        "sdl3",
+        "sdl-gpu",
+        "vulkan",
+        "metal"
+    ],
     "license": "MIT",
+    "homepage": "https://venusian.projectsaturnstudios.com/ecosystem/jovian/venusian-sdl3/0.10.x",
+    "support": {
+        "issues": "https://github.com/jovian-packages/venusian-sdl3/issues",
+        "source": "https://github.com/jovian-packages/venusian-sdl3"
+    },
     "authors": [
         {
             "name": "Angel Gonzalez",
@@ -13,50 +27,40 @@
     ],
     "require": {
         "php": "^8.4|^8.5|^8.6",
-        "jovian/sdl3": "^0.8.0",
-        "venusian-surface/contracts": "^0.8.0",
-        "venusian-surface/drawing": "^0.8.0",
-        "venusian-surface/human-input": "^0.8.0",
-        "venusian-surface/stage": "^0.8.0",
-        "venusian-voyager/contracts": "^0.8.0",
-        "venusian-voyager/nuts-and-bolts": "^0.8.0"
+        "ext-sdl3": "^0.10",
+        "venusian-surface/contracts": "^0.10.0",
+        "venusian-surface/drawing": "^0.10.0",
+        "venusian-surface/framebuffers": "^0.10.0",
+        "venusian-voyager/nuts-and-bolts": "^0.10.1"
     },
     "require-dev": {
-        "pestphp/pest": "^4"
+        "pestphp/pest": "^4",
+        "venusian-surface/fonts": "^0.10.0"
     },
     "autoload": {
         "psr-4": {
-            "Jovian\\Venusian\\Sdl3\\": "src/"
+            "Jovian\\Engines\\Sdl3\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "Venusian\\Tests\\": "tests/"
+            "Jovian\\Engines\\Sdl3\\Tests\\": "tests/"
         }
     },
-    "repositories": [
-        { "type": "path", "url": "../sdl3" },
-        { "type": "path", "url": "../../venusian/surface" },
-        {
-            "type": "path",
-            "url": "../../venusian/framework/src/Voyager/Contracts",
-            "options": { "symlink": true, "versions": { "venusian-voyager/contracts": "0.8.4" } }
-        },
-        {
-            "type": "path",
-            "url": "../../venusian/framework/src/Voyager/IOPools",
-            "options": { "symlink": true, "versions": { "venusian-voyager/io-pools": "0.8.4" } }
-        }
-    ],
     "config": {
         "sort-packages": true,
-        "allow-plugins": { "pestphp/pest-plugin": true }
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
     },
     "extra": {
-        "branch-alias": { "dev-main": "0.8.x-dev" },
+        "branch-alias": {
+            "dev-main": "0.10.x-dev"
+        },
         "venusian": {
-            "providers": ["Jovian\\Venusian\\Sdl3\\Providers\\VenusianSdl3ServiceProvider"],
-            "aliases": {}
+            "providers": [
+                "Jovian\\Engines\\Sdl3\\Providers\\VenusianSdl3ServiceProvider"
+            ]
         }
     },
     "minimum-stability": "dev",
