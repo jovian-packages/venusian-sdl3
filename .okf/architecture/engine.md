@@ -81,3 +81,9 @@ An upload into `resolved` with 4 samples sets `stale`. The next `draw()` first r
 [^device]: src/Sdl3Device.php
 [^frag]: resources/shaders/venusian.frag
 [^metal]: resources/shaders/venusian.metal
+
+# Presenting and HDR
+
+Present = show pass: target → `presentRect()`, window's filter, black bars, encoded for swapchain. Vsync VSYNC / IMMEDIATE / MAILBOX, no adaptive; under VSYNC off Metal, nothing presented while window hidden/occluded/minimised (Metal never stalls). `frames_in_flight` 1-3. No present times (SDL_GPU has none). Window claim given back with the surface.
+
+HDR where window has the composition: rgba16float extended-linear sRGB / P3 through `HDR_EXTENDED_LINEAR`, rgb10a2 HDR10 through `HDR10_ST2084`. No P3 SDR, no HDR metadata: SDL_GPU has neither. Stager: GL borrower asking `'native'` gets the native window (opengl engine's own HDR surface).

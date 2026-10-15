@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 use Jovian\Engines\Sdl3\Sdl3Device;
 use Jovian\Engines\Sdl3\Providers\VenusianSdl3ServiceProvider;
+use Surface\Bridge\ToolkitManager;
 use Surface\Contracts\Drawing\DrawingException;
 use Surface\Contracts\Drawing\RenderingEngine;
+use Surface\Contracts\HumanInput\Key;
 use Surface\Drawing\Gpu\GpuRenderingEngine;
+use Surface\HumanInput\HumanInputManager;
 use Surface\NutsAndBolts\Color;
 
 it('registers the sdl3 engine on the drawing manager', function (): void {
@@ -32,7 +35,7 @@ it('refuses the Velvet-only arguments by name', function (): void {
     VenusianSdl3ServiceProvider::extend($drawing);
 
     $drawing->renderer('sdl3', ['width' => 16, 'height' => 8, 'mode' => 'ring']);
-})->throws(DrawingException::class, "sdl3 does not take 'mode'. It takes: output, width, height, edges.");
+})->throws(DrawingException::class, "sdl3 does not take 'mode'. It takes: output, width, height, edges, format, colorspace, frames_in_flight, resolution.");
 
 it('brings SDL video up for the engine it builds', function (): void {
     SDL_Quit();
@@ -68,3 +71,56 @@ it('leaves the macOS application to AppKit when it brings SDL video up', functio
         ->and($no_menu)->toBeTrue()
         ->and($delegate)->not->toBeIn([null, 'SDL3AppDelegate']);
 })->skip(fn () => PHP_OS_FAMILY !== 'Darwin' || ! class_exists(NSApplication::class), 'the macOS application is AppKit\'s only where ext-appkit is loaded');
+
+it('registers the sdl3 input engine: HumanInput follows the SDL session and reads its keys', function (): void {
+    $toolkits = new class extends ToolkitManager {
+        public function __construct()
+        {
+            $this->drivers = ['sdl3' => stager()];
+        }
+
+        public function getDefaultDriver(): string
+        {
+            return 'sdl3';
+        }
+    };
+    $input = new HumanInputManager($toolkits, inputFrame(), device_os_family(), null, fn (object $mail) => null);
+    VenusianSdl3ServiceProvider::input($input, $toolkits);
+    $window = inputWindow('provided');
+
+    $input->poll();
+    SDL_PushEvent(keyEvent($window, SDL_SCANCODE_Q, true));
+    stager()->connect()->pump(0);
+
+    try {
+        expect(array_keys($input->engines()))->toBe(['sdl3'])
+            ->and($input->keyboard()->isDown(Key::Q))->toBeTrue();
+    } finally {
+        $input->destroy();
+        $window->close();
+    }
+});
+
+it('registers the sdl3 pad source: HumanInput lists SDL pads with no session', function (): void {
+    $id = virtualPad('provided pad');
+    $input = new HumanInputManager(new class extends ToolkitManager {
+        public function __construct() {}
+
+        public function getDefaultDriver(): string
+        {
+            return 'none';
+        }
+    }, inputFrame(), device_os_family(), 'sdl3', fn (object $mail) => null);
+    VenusianSdl3ServiceProvider::pads($input);
+
+    $input->poll();
+
+    try {
+        expect($input->pads())->toBeInstanceOf(Jovian\Engines\Sdl3\Input\Sdl3PadSource::class)
+            ->and($input->engines())->toBe([])
+            ->and($input->gameControllers())->toHaveKey("sdl3-{$id}");
+    } finally {
+        $input->destroy();
+        letGoOfPads();
+    }
+});

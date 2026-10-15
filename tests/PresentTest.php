@@ -10,6 +10,9 @@ use Surface\Contracts\Drawing\SurfaceKind;
 use Surface\Contracts\Framebuffers\Region;
 use Surface\Drawing\Gpu\GpuRenderingEngine;
 use Surface\NutsAndBolts\Color;
+use Surface\Contracts\Drawing\VSync;
+use Surface\Contracts\Windows\ScaleFilter;
+use Surface\Contracts\Windows\ScaleFit;
 
 /*
  * Presenting: a hidden SDL window of this process stands in for a window a
@@ -17,18 +20,6 @@ use Surface\NutsAndBolts\Color;
  */
 
 beforeEach(fn () => video());
-
-function sdlWindow(int $width = 64, int $height = 32): SDL_Window
-{
-    video();
-
-    return SDL_CreateWindow('venusian-sdl3 test', $width, $height, SDL_WINDOW_HIDDEN) ?? throw new RuntimeException('SDL_CreateWindow: '.SDL_GetError());
-}
-
-function windowSurface(SDL_Window $window, int $width = 64, int $height = 32): LentSurface
-{
-    return new LentSurface(SurfaceKind::SDL_WINDOW, ['window' => $window->pointer()], fn (): array => [$width, $height]);
-}
 
 it('claims the window it adopts', function (): void {
     $window = sdlWindow();
@@ -169,3 +160,81 @@ it('refuses readback and upload after release()', function (string $call): void 
 
     $call === 'read' ? $target->readRgba8(new Region(0, 0, 8, 8)) : $target->uploadRgba8(str_repeat("\x00", 256), new Region(0, 0, 8, 8));
 })->with(['read', 'upload'])->throws(DrawingException::class, 'sdl3: this device was released.');
+
+it('gives the window back when the surface is released', function (): void {
+    $window = sdlWindow();
+    $first = new Sdl3Device;
+    $surface = windowSurface($window);
+    $first->adopt($surface);
+
+    $surface->release();
+    $second = new Sdl3Device;
+    $claimed = SDL_ClaimWindowForGPUDevice($second->gpu(), $window);
+
+    expect($claimed)->toBeTrue()
+        ->and($first->present($surface))->toBeFalse();
+    SDL_ReleaseWindowFromGPUDevice($second->gpu(), $window);
+    $second->release();
+    $first->release();
+    SDL_DestroyWindow($window);
+});
+
+it('follows vsync through the swapchain\'s present mode', function (): void {
+    $window = sdlWindow();
+    $device = new Sdl3Device;
+    $device->adopt(windowSurface($window));
+    $modes = $device->vsyncModes();
+
+    $device->applyVsync(VSync::On);
+
+    expect($modes[0])->toBe(VSync::On)
+        ->and(fn () => $device->applyVsync(VSync::Adaptive))->toThrow(DrawingException::class, 'sdl3 has no adaptive vsync.')
+        ->and(fn () => $device->setFramesInFlight(4))->toThrow(DrawingException::class, 'sdl3 keeps 1 to 3 frames in flight, got 4.');
+    $device->setFramesInFlight(2);
+    $device->release();
+    SDL_DestroyWindow($window);
+});
+
+it('places a target of another size by the surface fit and presents it through the show pass', function (): void {
+    $window = sdlWindow(64, 64);
+    SDL_ShowWindow($window);
+    $device = new Sdl3Device;
+    $engine = new GpuRenderingEngine($device, 32, 16);
+    $surface = windowSurface($window, 64, 64);
+    $device->adopt($surface);
+    $surface->changeScaling(ScaleFilter::Linear, ScaleFit::Letterbox);
+    $engine->frame(fn (RenderingEngine $g) => $g->clear(Color::rgb(0, 128, 255)));
+
+    $results = [];
+    for ($i = 0; $i < 10; $i++) {
+        $results[] = $device->present($surface);
+        SDL_PumpEvents();
+        $device->finish();
+    }
+
+    expect($results)->toContain(true)
+        ->and($device->transform())->toBe([0, 1.0, 203.0]);
+    $device->release();
+    SDL_DestroyWindow($window);
+})->skip(fn () => PHP_OS_FAMILY === 'Linux' && getenv('WAYLAND_DISPLAY') === false, 'a window needs the Wayland session');
+
+it('presents nothing under vsync while the window is hidden, and never waits for it', function (): void {
+    $window = sdlWindow(32, 32);
+    $device = new Sdl3Device;
+    $engine = new GpuRenderingEngine($device, 32, 32);
+    $device->adopt(windowSurface($window, 32, 32));
+    $device->applyVsync(VSync::On);
+    $engine->frame(fn (RenderingEngine $g) => $g->clear(Color::rgb(255, 0, 0)));
+
+    $started = hrtime(true);
+    $results = [];
+    for ($i = 0; $i < 5; $i++) {
+        $results[] = $device->present(windowSurface($window, 32, 32));
+    }
+
+    // Over Metal a hidden window takes presents without waiting (measured); elsewhere none goes out.
+    expect($device->driver() === 'metal' || $results === [false, false, false, false, false])->toBeTrue()
+        ->and((hrtime(true) - $started) / 1e6)->toBeLessThan(50.0);
+    $engine->release();
+    SDL_DestroyWindow($window);
+})->skip(fn () => PHP_OS_FAMILY === 'Linux' && getenv('WAYLAND_DISPLAY') === false, 'a window needs the Wayland session');

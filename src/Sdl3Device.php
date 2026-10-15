@@ -35,17 +35,25 @@ use SDL_GPUVertexBufferDescription;
 use SDL_GPUViewport;
 use SDL_Rect;
 use SDL_Window;
+use Surface\Contracts\Drawing\ColorSpace;
 use Surface\Contracts\Drawing\DrawingException;
 use Surface\Contracts\Drawing\LentSurface;
 use Surface\Contracts\Drawing\SurfaceKind;
+use Surface\Contracts\Drawing\TargetFormat;
+use Surface\Contracts\Drawing\VSync;
 use Surface\Contracts\Framebuffers\Filter;
 use Surface\Contracts\Framebuffers\Framebuffer;
 use Surface\Contracts\Framebuffers\GLFramebuffer;
 use Surface\Contracts\Framebuffers\Region;
 use Surface\Contracts\Rasterize\FillRule;
+use Surface\Contracts\Windows\ScaleFilter;
 use Surface\Drawing\Gpu\DrawList;
 use Surface\Drawing\Gpu\GpuDevice;
 use Surface\Drawing\Gpu\Op;
+use Surface\Drawing\Gpu\QueuesFrames;
+use Surface\Drawing\Gpu\SwitchesVsync;
+use Surface\Drawing\Gpu\TargetsFormats;
+use Surface\Framebuffers\HdrImage;
 use Throwable;
 
 /**
@@ -59,8 +67,25 @@ use Throwable;
  * $resolved first. The stencil lives in a depth-stencil texture in the format
  * the device supports, cleared every pass: paths fill stencil-then-cover and
  * leave it at zero.
+ *
+ * Presenting: the show pass draws the target into the swapchain texture,
+ * presentRect() at the swapchain's size sampled with the surface's filter,
+ * the bars black, encoded for the swapchain. The window's vsync picks the
+ * present mode (VSYNC, IMMEDIATE, MAILBOX; MAILBOX, else VSYNC, until it
+ * does); SDL_GPU has no adaptive mode and reports no present times. Under
+ * VSYNC, off the Metal backend, nothing is presented while the window is
+ * occluded, minimised or hidden: the compositor would make the present wait
+ * until it shows again. Metal hands out drawables to hidden windows.
+ * The window is claimed at adopt() and given back when the window reclaims
+ * its surface.
+ *
+ * HDR: every HDR target is an R16G16B16A16_FLOAT texture of linear light in
+ * sRGB primaries, SDR white at 1.0. Both extended spaces show through the
+ * HDR_EXTENDED_LINEAR composition, the show pass multiplying by the surface's
+ * SDR white level; HDR10 shows through HDR10_ST2084, the show pass encoding
+ * BT.2020 PQ. SDL_GPU has no P3 composition and takes no HDR metadata.
  */
-final class Sdl3Device implements GpuDevice
+final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, TargetsFormats
 {
     /** The shader directory: GLSL with its compiled SPIR-V, and MSL. */
     public const string SHADERS = __DIR__.'/../resources/shaders';
@@ -124,6 +149,26 @@ final class Sdl3Device implements GpuDevice
     private bool $stale = false;
 
     private ?SDL_Window $window = null;
+
+    private ColorSpace $space = ColorSpace::Srgb;
+
+    /** The target texture's format: half floats for every HDR colour space. */
+    private int $colorFormat = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+
+    /** @var array<int, true> Half-float image textures of the frame being drawn, by object id. */
+    private array $floatTextures = [];
+
+    /** The adopted surface, while it is lent. */
+    private ?LentSurface $lent = null;
+
+    /** The swapchain's present mode. */
+    private int $presentMode = SDL_GPU_PRESENTMODE_VSYNC;
+
+    /** @var array<int, SDL_GPUShader> The show pass's shaders, by stage. */
+    private array $showShaders = [];
+
+    /** @var array<int, SDL_GPUGraphicsPipeline> The show pipeline, by swapchain texture format. */
+    private array $showPipelines = [];
 
     /** @var array<int, array{int, int}> Image texture sizes by object id, for the frame being drawn. */
     private array $sizes = [];
@@ -207,7 +252,7 @@ final class Sdl3Device implements GpuDevice
             ?? throw new DrawingException('sdl3: the '.($fragment ? 'fragment' : 'vertex').' shader was refused: '.SDL_GetError());
     }
 
-    public function target(int $width, int $height, int $samples): GLFramebuffer
+    private function make(int $width, int $height, int $samples, ColorSpace $space): GLFramebuffer
     {
         if ($samples !== 1 && $samples !== 4) {
             throw new DrawingException("sdl3 draws with 1 or 4 samples, got {$samples}.");
@@ -219,11 +264,14 @@ final class Sdl3Device implements GpuDevice
         $this->live();
         $this->finish();
         $this->releaseTarget();
+        $this->space = $space;
+        $this->colorFormat = $space->isHdr() ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        $this->swapchainParameters();
         $this->samples = $samples;
-        $this->resolved = $this->texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        $this->resolved = $this->texture($this->colorFormat, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
         $this->owned[spl_object_id($this->resolved)] = $this->resolved;
-        $this->framebuffer = new Sdl3Framebuffer($this, $this->resolved, $width, $height);
-        $this->multisampled = $samples === 4 ? $this->texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, $width, $height, SDL_GPU_SAMPLECOUNT_4, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET) : null;
+        $this->framebuffer = new Sdl3Framebuffer($this, $this->resolved, $width, $height, $space->isHdr());
+        $this->multisampled = $samples === 4 ? $this->texture($this->colorFormat, $width, $height, SDL_GPU_SAMPLECOUNT_4, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET) : null;
         $this->stencil = $this->texture($this->stencil_format, $width, $height, $samples === 4 ? SDL_GPU_SAMPLECOUNT_4 : SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET);
 
         // Defined contents from the start: transparent black, as a new framebuffer holds.
@@ -236,12 +284,38 @@ final class Sdl3Device implements GpuDevice
         return $this->framebuffer;
     }
 
+    public function target(int $width, int $height, int $samples): GLFramebuffer
+    {
+        return $this->make($width, $height, $samples, ColorSpace::Srgb);
+    }
+
+    public function targetFormats(): array
+    {
+        $usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+
+        return SDL_GPUTextureSupportsFormat($this->gpu, SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT, SDL_GPU_TEXTURETYPE_2D, $usage)
+            ? [[TargetFormat::Rgba16Float, ColorSpace::ExtendedLinearSrgb], [TargetFormat::Rgba16Float, ColorSpace::ExtendedLinearDisplayP3], [TargetFormat::Rgb10A2, ColorSpace::Hdr10Pq]]
+            : [];
+    }
+
+    public function targetAs(int $width, int $height, int $samples, TargetFormat $format, ColorSpace $space): GLFramebuffer
+    {
+        if (! in_array([$format, $space], $this->targetFormats(), true)) {
+            throw new DrawingException("sdl3 makes no {$format->value} {$space->value} target.");
+        }
+        if (! is_null($this->window) && ! SDL_WindowSupportsGPUSwapchainComposition($this->gpu, $this->window, $this->compositionFor($space))) {
+            throw new DrawingException("sdl3: this window shows no {$space->value} swapchain on {$this->driver()}.");
+        }
+
+        return $this->make($width, $height, $samples, $space);
+    }
+
     /** @internal Sdl3Framebuffer's readback: $region of $texture as RGBA8, once the last frame has finished. */
-    public function read(SDL_GPUTexture $texture, Region $region): string
+    public function read(SDL_GPUTexture $texture, Region $region, int $bytes = 4): string
     {
         $this->live();
         $this->finish();
-        $size = $region->width * $region->height * 4;
+        $size = $region->width * $region->height * $bytes;
         $download = $this->transferBuffer($size, SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD);
         try {
             $this->encode(function (SDL_GPUCommandBuffer $commands) use ($texture, $region, $download): void {
@@ -271,13 +345,13 @@ final class Sdl3Device implements GpuDevice
     }
 
     /** @internal Sdl3Framebuffer's upload: $rgba8 over $region of $texture. The multisampled target is restored from it at the next draw. */
-    public function write(SDL_GPUTexture $texture, string $rgba8, Region $region): void
+    public function write(SDL_GPUTexture $texture, string $texels, Region $region): void
     {
         $this->live();
         $this->finish();
-        $upload = $this->transferBuffer(strlen($rgba8), SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
+        $upload = $this->transferBuffer(strlen($texels), SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
         try {
-            $this->fillTransfer($upload, $rgba8);
+            $this->fillTransfer($upload, $texels);
             $this->encode(function (SDL_GPUCommandBuffer $commands) use ($texture, $region, $upload): void {
                 $copy = SDL_BeginGPUCopyPass($commands) ?? throw new DrawingException('sdl3: no copy pass could begin: '.SDL_GetError());
                 $from = new SDL_GPUTextureTransferInfo();
@@ -404,7 +478,7 @@ final class Sdl3Device implements GpuDevice
                             $this->bindTexture($pass, $textures[$texture]);
                             [$w, $h] = $this->sizes[spl_object_id($textures[$texture])];
                             $this->uniforms($commands, self::paintBytes(self::IMAGE, 0, opacity: $opacity, linear: $filter === Filter::LINEAR ? 1 : 0,
-                                abcd: [$inverse->a, $inverse->b, $inverse->c, $inverse->d], efwh: [$inverse->e, $inverse->f, (float) $w, (float) $h]));
+                                abcd: [$inverse->a, $inverse->b, $inverse->c, $inverse->d], efwh: [$inverse->e, $inverse->f, (float) $w, (float) $h], flags: isset($this->floatTextures[spl_object_id($textures[$texture])]) ? 2 : 0));
                             SDL_DrawGPUPrimitives($pass, 6, 1, $first, 0);
                             break;
                     }
@@ -415,6 +489,7 @@ final class Sdl3Device implements GpuDevice
         } finally {
             foreach ($textures as $texture) {
                 unset($this->sizes[spl_object_id($texture)]);
+                unset($this->floatTextures[spl_object_id($texture)]);
                 SDL_ReleaseGPUTexture($this->gpu, $texture);
             }
             SDL_ReleaseGPUBuffer($this->gpu, $buffer);
@@ -427,25 +502,191 @@ final class Sdl3Device implements GpuDevice
         if (! SDL_ClaimWindowForGPUDevice($this->gpu, $window)) {
             throw new DrawingException('sdl3: the window could not be claimed for the device: '.SDL_GetError());
         }
-        // MAILBOX where the window takes it: Wayland's FIFO present waits on the
-        // compositor's frame callback, forever for a window it is not showing.
-        // Metal has no MAILBOX; its VSYNC waits on nextDrawable for at most a refresh.
-        if (! SDL_SetGPUSwapchainParameters($this->gpu, $window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_MAILBOX)) {
-            SDL_SetGPUSwapchainParameters($this->gpu, $window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
-        }
         $this->window = $window;
+        $this->lent = $surface;
+        // MAILBOX where the window takes it until the window's vsync says otherwise: a present never waits on the display.
+        $this->presentMode = SDL_WindowSupportsGPUPresentMode($this->gpu, $window, SDL_GPU_PRESENTMODE_MAILBOX) ? SDL_GPU_PRESENTMODE_MAILBOX : SDL_GPU_PRESENTMODE_VSYNC;
+        $this->swapchainParameters();
+        $surface->onRelease(fn () => $this->unclaim());
+    }
+
+    public function vsyncModes(): array
+    {
+        if (is_null($this->window)) {
+            return [];
+        }
+        $modes = [VSync::On];
+        if (SDL_WindowSupportsGPUPresentMode($this->gpu, $this->window, SDL_GPU_PRESENTMODE_IMMEDIATE)) {
+            $modes[] = VSync::Off;
+        }
+        if (SDL_WindowSupportsGPUPresentMode($this->gpu, $this->window, SDL_GPU_PRESENTMODE_MAILBOX)) {
+            $modes[] = VSync::Mailbox;
+        }
+
+        return $modes;
+    }
+
+    public function applyVsync(VSync $vsync): void
+    {
+        $mode = match ($vsync) {
+            VSync::On => SDL_GPU_PRESENTMODE_VSYNC,
+            VSync::Off => SDL_GPU_PRESENTMODE_IMMEDIATE,
+            VSync::Mailbox => SDL_GPU_PRESENTMODE_MAILBOX,
+            VSync::Adaptive => throw new DrawingException('sdl3 has no adaptive vsync.'),
+        };
+        $window = $this->window ?? throw new DrawingException('sdl3: adopt() a surface before applyVsync().');
+        if (! SDL_WindowSupportsGPUPresentMode($this->gpu, $window, $mode)) {
+            throw new DrawingException("sdl3: this window does not present with vsync {$vsync->value}.");
+        }
+        $this->presentMode = $mode;
+        $this->swapchainParameters();
+    }
+
+    public function setFramesInFlight(int $frames): void
+    {
+        if ($frames < 1 || $frames > 3) {
+            throw new DrawingException("sdl3 keeps 1 to 3 frames in flight, got {$frames}.");
+        }
+        if (! SDL_SetGPUAllowedFramesInFlight($this->gpu, $frames)) {
+            throw new DrawingException('sdl3: the frames in flight were refused: '.SDL_GetError());
+        }
     }
 
     /**
-     * Blit the resolved texture into the window's next swapchain texture and
-     * present. No wait: when the swapchain has no texture ready, the command
-     * buffer is cancelled and nothing is copied.
+     * @internal The show pass's encoding for the current target: the
+     * transform code (0 as stored, 1 extended linear, 2 PQ), the SDR white
+     * level, and the nits an HDR10 value of 1.0 shows at.
+     *
+     * @return array{int, float, float}
+     */
+    public function transform(): array
+    {
+        $level = $this->lent?->hdr()?->sdrWhiteLevel ?? 1.0;
+        $white = $level > 0.0 ? $level : 1.0;
+
+        return [$this->transformCode(), $white, max(203.0, 80.0 * $white)];
+    }
+
+    /** The swapchain composition the target needs. */
+    private function composition(): int
+    {
+        return $this->compositionFor($this->space);
+    }
+
+    /** Extended linear for both extended spaces, HDR10 ST 2084 for HDR10, SDR otherwise. */
+    private function compositionFor(ColorSpace $space): int
+    {
+        return match ($space) {
+            ColorSpace::ExtendedLinearSrgb, ColorSpace::ExtendedLinearDisplayP3 => SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR,
+            ColorSpace::Hdr10Pq => SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084,
+            default => SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+        };
+    }
+
+    /** The transform code: extended linear × white, HDR10 as PQ, SDR as stored. */
+    private function transformCode(): int
+    {
+        return match ($this->space) {
+            ColorSpace::ExtendedLinearSrgb, ColorSpace::ExtendedLinearDisplayP3 => 1,
+            ColorSpace::Hdr10Pq => 2,
+            default => 0,
+        };
+    }
+
+    /** The swapchain's composition and present mode, for the claimed window. */
+    private function swapchainParameters(): void
+    {
+        if (is_null($this->window)) {
+            return;
+        }
+        if (! SDL_SetGPUSwapchainParameters($this->gpu, $this->window, $this->composition(), $this->presentMode)) {
+            throw new DrawingException('sdl3: the swapchain refused its parameters: '.SDL_GetError());
+        }
+    }
+
+
+    /** Give the window back: the GPU idle first, so nothing in flight still uses its swapchain. */
+    private function unclaim(): void
+    {
+        if ($this->released || is_null($this->window)) {
+            return;
+        }
+        $this->finish();
+        SDL_WaitForGPUIdle($this->gpu);
+        SDL_ReleaseWindowFromGPUDevice($this->gpu, $this->window);
+        $this->window = null;
+        $this->lent = null;
+    }
+
+    /** The show pass's shader of $stage, compiled once in the format the device takes: SPIR-V where it can, MSL otherwise. */
+    public function showShader(int $stage): SDL_GPUShader
+    {
+        if (isset($this->showShaders[$stage])) {
+            return $this->showShaders[$stage];
+        }
+
+        $fragment = $stage === SDL_GPU_SHADERSTAGE_FRAGMENT;
+        $info = new SDL_GPUShaderCreateInfo();
+        $info->stage = $stage;
+        if (SDL_GetGPUShaderFormats($this->gpu) & SDL_GPU_SHADERFORMAT_SPIRV) {
+            $info->format = SDL_GPU_SHADERFORMAT_SPIRV;
+            $info->code = file_get_contents(self::SHADERS.'/show.'.($fragment ? 'frag' : 'vert').'.spv');
+            $info->entrypoint = 'main';
+        } else {
+            $info->format = SDL_GPU_SHADERFORMAT_MSL;
+            $info->code = file_get_contents(self::SHADERS.'/venusian.metal');
+            $info->entrypoint = $fragment ? 'show' : 'show_place';
+        }
+        $info->num_uniform_buffers = $fragment ? 1 : 0;
+        $info->num_samplers = $fragment ? 1 : 0;
+
+        return $this->showShaders[$stage] = SDL_CreateGPUShader($this->gpu, $info)
+            ?? throw new DrawingException('sdl3: the show '.($fragment ? 'fragment' : 'vertex').' shader was refused: '.SDL_GetError());
+    }
+
+    /** The show pipeline for a swapchain texture of $format: one triangle, no vertex input, no blending, one sample, no stencil. */
+    private function showPipeline(int $format): SDL_GPUGraphicsPipeline
+    {
+        if (isset($this->showPipelines[$format])) {
+            return $this->showPipelines[$format];
+        }
+        $info = new SDL_GPUGraphicsPipelineCreateInfo();
+        $info->vertex_shader = $this->showShader(SDL_GPU_SHADERSTAGE_VERTEX);
+        $info->fragment_shader = $this->showShader(SDL_GPU_SHADERSTAGE_FRAGMENT);
+        $info->primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        $info->rasterizer_state->fill_mode = SDL_GPU_FILLMODE_FILL;
+        $info->rasterizer_state->cull_mode = SDL_GPU_CULLMODE_NONE;
+        $info->rasterizer_state->front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+        $info->multisample_state->sample_count = SDL_GPU_SAMPLECOUNT_1;
+        $color = new SDL_GPUColorTargetDescription();
+        $color->format = $format;
+        $color->blend_state->enable_color_write_mask = true;
+        $color->blend_state->color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A;
+        $color->blend_state->enable_blend = false;
+        $info->target_info->color_target_descriptions = [$color];
+        $info->target_info->has_depth_stencil_target = false;
+
+        return $this->showPipelines[$format] = SDL_CreateGPUGraphicsPipeline($this->gpu, $info)
+            ?? throw new DrawingException("sdl3: the show pipeline was refused by {$this->driver()}: ".SDL_GetError());
+    }
+
+    /**
+     * Draw the resolved texture into the window's next swapchain texture with
+     * the show pass (presentRect() at the swapchain's size, the surface's
+     * filter, the bars black, encoded for the swapchain) and present. No
+     * wait: under VSYNC off Metal nothing is presented while the window is
+     * occluded, minimised or hidden; when the swapchain has no texture ready, the
+     * command buffer is cancelled and nothing is drawn.
      */
     public function present(LentSurface $surface): bool
     {
+        if ($surface->released()) {
+            return false;
+        }
         $window = $this->window ?? throw new DrawingException('sdl3: adopt() a surface before present().');
         $target = $this->framebuffer ?? throw new DrawingException('sdl3: target() comes before present().');
-        if ($surface->released()) {
+        // Metal hands out drawables to hidden windows (measured); elsewhere VSYNC waits on the compositor.
+        if ($this->presentMode === SDL_GPU_PRESENTMODE_VSYNC && $this->driver() !== 'metal' && (SDL_GetWindowFlags($window) & (SDL_WINDOW_OCCLUDED | SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) !== 0) {
             return false;
         }
 
@@ -458,15 +699,24 @@ final class Sdl3Device implements GpuDevice
 
             return false;
         }
+        [$filter, $fit] = $surface->scaling();
+        $placed = $fit->rect($width, $height, $target->width(), $target->height());
+        [$transform, $white, $nits] = $this->transform();
 
-        $blit = new SDL_GPUBlitInfo();
-        $blit->source->texture = $this->resolved;
-        [$blit->source->w, $blit->source->h] = [$target->width(), $target->height()];
-        $blit->destination->texture = $swapchain;
-        [$blit->destination->w, $blit->destination->h] = [$width, $height];
-        $blit->load_op = SDL_GPU_LOADOP_DONT_CARE;
-        $blit->filter = SDL_GPU_FILTER_NEAREST;
-        SDL_BlitGPUTexture($commands, $blit);
+        $color = new SDL_GPUColorTargetInfo();
+        $color->texture = $swapchain;
+        $color->load_op = SDL_GPU_LOADOP_DONT_CARE;
+        $color->store_op = SDL_GPU_STOREOP_STORE;
+        $pass = SDL_BeginGPURenderPass($commands, [$color], null)
+            ?? throw new DrawingException('sdl3: the show pass could not begin: '.SDL_GetError());
+        SDL_BindGPUGraphicsPipeline($pass, $this->showPipeline(SDL_GetGPUSwapchainTextureFormat($this->gpu, $window)));
+        $this->bindTexture($pass, $this->resolved);
+        $show = pack('g4', (float) $placed->x, (float) $placed->y, (float) $placed->width, (float) $placed->height)
+            .pack('g4', (float) $target->width(), (float) $target->height(), $white, $nits)
+            .pack('V4', $filter === ScaleFilter::Linear ? 1 : 0, $transform, 0, 0);
+        SDL_PushGPUFragmentUniformData($commands, 0, $show, strlen($show));
+        SDL_DrawGPUPrimitives($pass, 3, 1, 0, 0);
+        SDL_EndGPURenderPass($pass);
         $this->submit($commands);
 
         return true;
@@ -505,7 +755,15 @@ final class Sdl3Device implements GpuDevice
         if (! is_null($this->window)) {
             SDL_ReleaseWindowFromGPUDevice($this->gpu, $this->window);
             $this->window = null;
+            $this->lent = null;
         }
+        foreach ($this->showPipelines as $pipeline) {
+            SDL_ReleaseGPUGraphicsPipeline($this->gpu, $pipeline);
+        }
+        foreach ($this->showShaders as $shader) {
+            SDL_ReleaseGPUShader($this->gpu, $shader);
+        }
+        $this->showPipelines = $this->showShaders = [];
         if ($this->owns_gpu) {
             SDL_DestroyGPUDevice($this->gpu);
         }
@@ -558,8 +816,11 @@ final class Sdl3Device implements GpuDevice
         $this->uniforms($commands, self::paintBytes($mode, $rgba));
     }
 
+    /** The Paint block, with the target's HDR flag ORed into mode_rgba[0].w (byte 12). */
     private function uniforms(SDL_GPUCommandBuffer $commands, string $bytes): void
     {
+        $flags = unpack('V', $bytes, 12)[1] | ($this->space->isHdr() ? 1 : 0);
+        $bytes = substr_replace($bytes, pack('V', $flags), 12, 4);
         SDL_PushGPUFragmentUniformData($commands, 0, $bytes, strlen($bytes));
     }
 
@@ -621,13 +882,17 @@ final class Sdl3Device implements GpuDevice
     {
         $width = $source->viewportWidth();
         $height = $source->viewportHeight();
-        $texture = $this->texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        $float = $source instanceof HdrImage && $this->space->isHdr();
+        $texture = $this->texture($float ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_SAMPLER);
         $this->sizes[spl_object_id($texture)] = [$width, $height];
+        if ($float) {
+            $this->floatTextures[spl_object_id($texture)] = true;
+        }
         $staging = null;
         try {
-            $rgba8 = $source->toRgba8();
-            $staging = $this->transferBuffer(strlen($rgba8), SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
-            $this->fillTransfer($staging, $rgba8);
+            $texels = $float ? $source->rgba16f() : $source->toRgba8();
+            $staging = $this->transferBuffer(strlen($texels), SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
+            $this->fillTransfer($staging, $texels);
             $copy = SDL_BeginGPUCopyPass($commands) ?? throw new DrawingException('sdl3: no copy pass could begin: '.SDL_GetError());
             $from = new SDL_GPUTextureTransferInfo();
             $from->transfer_buffer = $staging;
@@ -637,6 +902,7 @@ final class Sdl3Device implements GpuDevice
             SDL_EndGPUCopyPass($copy);
         } catch (Throwable $failure) {
             unset($this->sizes[spl_object_id($texture)]);
+            unset($this->floatTextures[spl_object_id($texture)]);
             SDL_ReleaseGPUTexture($this->gpu, $texture);
 
             throw $failure;
@@ -703,7 +969,7 @@ final class Sdl3Device implements GpuDevice
         }
 
         $color = new SDL_GPUColorTargetDescription();
-        $color->format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        $color->format = $this->colorFormat;
         $blend = $color->blend_state;
         $blend->enable_color_write_mask = true;
         $blend->color_write_mask = in_array($kind, ['winding', 'invert'], true)
@@ -725,7 +991,7 @@ final class Sdl3Device implements GpuDevice
     }
 
     /**
-     * The Paint block, 96 bytes: mode_rgba[0] = mode, opacity, linear, 0;
+     * The Paint block, 96 bytes: mode_rgba[0] = mode, opacity, linear, flags;
      * mode_rgba[1] = r, g, b, a; shape; band; abcd; efwh.
      *
      * @param  array{float, float, float, float}  $shape
@@ -733,9 +999,9 @@ final class Sdl3Device implements GpuDevice
      * @param  array{float, float, float, float}  $abcd
      * @param  array{float, float, float, float}  $efwh
      */
-    private static function paintBytes(int $mode, int $rgba, int $opacity = 255, int $linear = 0, array $shape = [0.0, 0.0, 0.0, 0.0], array $band = [0.0, 0.0, 0.0, 0.0], array $abcd = [0.0, 0.0, 0.0, 0.0], array $efwh = [0.0, 0.0, 0.0, 0.0]): string
+    private static function paintBytes(int $mode, int $rgba, int $opacity = 255, int $linear = 0, array $shape = [0.0, 0.0, 0.0, 0.0], array $band = [0.0, 0.0, 0.0, 0.0], array $abcd = [0.0, 0.0, 0.0, 0.0], array $efwh = [0.0, 0.0, 0.0, 0.0], int $flags = 0): string
     {
-        return pack('V4', $mode, $opacity, $linear, 0)
+        return pack('V4', $mode, $opacity, $linear, $flags)
             .pack('V4', ($rgba >> 24) & 0xFF, ($rgba >> 16) & 0xFF, ($rgba >> 8) & 0xFF, $rgba & 0xFF)
             .pack('g4', ...$shape).pack('g4', ...$band).pack('g4', ...$abcd).pack('g4', ...$efwh);
     }

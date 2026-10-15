@@ -28,14 +28,19 @@
     "require": {
         "php": "^8.4|^8.5|^8.6",
         "ext-sdl3": "^0.10",
+        "venusian-surface/bridge": "^0.10.0",
         "venusian-surface/contracts": "^0.10.0",
         "venusian-surface/drawing": "^0.10.0",
         "venusian-surface/framebuffers": "^0.10.0",
+        "venusian-surface/human-input": "^0.10.0",
+        "venusian-surface/windows": "^0.10.0",
         "venusian-voyager/nuts-and-bolts": "^0.10.1"
     },
     "require-dev": {
+        "jovian/venusian-vulkan": "^0.10.0",
         "pestphp/pest": "^4",
-        "venusian-surface/fonts": "^0.10.0"
+        "venusian-surface/fonts": "^0.10.0",
+        "venusian-voyager/vessel": "^0.10.1"
     },
     "autoload": {
         "psr-4": {
