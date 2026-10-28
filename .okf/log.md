@@ -1,8 +1,12 @@
 # Log
 
+## 2026-10-28
+
+* **Version**: 0.11.0 with the Venusian 0.11 ecosystem: `dev-main` → `0.11.x-dev`, its extensions, `venusian-surface/*`, `venusian-voyager/*` and the jovian siblings at `^0.11.0`, PHP `~8.4.27||^8.5.12`, homepage `0.11.x`. No API change. 160 passed on Homebrew PHP 8.4 NTS and ZTS (one ZTS exclusive-fullscreen row is flaky and passes on rerun); 156 passed, 4 skipped on the Pi (8.4 ZTS).
+
 ## 2026-10-08
 
-* HumanInput slice 18b: SDL's pads are the `sdl3` pad source (`Sdl3PadSource`, `extendPads('sdl3', …)`), read with or without a session or video; pads carry SDL's serial as `hardwareId()` and set SDL's player index; the engine lists no pads and taps its session at `connect()` or throws. [input](architecture/input.md)
+* SDL's pads are the `sdl3` pad source (`Sdl3PadSource`, `extendPads('sdl3', …)`), read with or without a session or video; pads carry SDL's serial as `hardwareId()` and set SDL's player index; the engine lists no pads and taps its session at `connect()` or throws. [input](architecture/input.md)
 
 ## 2026-10-08
 

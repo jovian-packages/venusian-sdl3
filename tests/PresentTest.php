@@ -16,7 +16,7 @@ use Surface\Contracts\Windows\ScaleFit;
 
 /*
  * Presenting: a hidden SDL window of this process stands in for a window a
- * toolkit canvas wraps (slice 9b).
+ * toolkit canvas wraps.
  */
 
 beforeEach(fn () => video());

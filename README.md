@@ -12,7 +12,7 @@ The engine's framebuffer is an `Sdl3Framebuffer`, a Surface `GLFramebuffer`.
 
 ## Requirements
 
-- macOS or Linux with SDL 3.2+ and ext-sdl3 ^0.10. PHP 8.4, `venusian-surface/drawing` ^0.10.
+- macOS or Linux with SDL 3.2+ and ext-sdl3 ^0.11. PHP 8.4, `venusian-surface/drawing` ^0.11.
 - SDL video: the provider's creator brings SDL's video subsystem up (`SDL_InitSubSystem`, reference-counted) before the device; it never quits it, since the process may hold SDL windows of its own. On macOS with ext-appkit it first makes sure the application exists and has a delegate (an empty trampoline when it has none): otherwise SDL makes its own application, with a Dock icon and menus, and makes itself the delegate. Since SDL's delegate is not there to do it, the session makes the process a regular app and brings it to the front while connected (and a focusable staged window brings it to the front when shown): a process started from a terminal otherwise shows windows that take clicks but never keys. An `Sdl3Device` built by hand needs video up first; without it the refusal is a `DrawingException` saying so.
 - On the Pi, the Wayland session (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`). No headless run there.
 
@@ -55,7 +55,7 @@ On a canvas.
 $engine = app('drawing')->renderer('sdl3', ['output' => $canvas]);
 ```
 
-Needs a toolkit that lends an SDL window (slice 9b). Until then the refusal reads `This window cannot host 'sdl3': it lends … It can host: …`.
+Needs a toolkit canvas that lends an SDL window. A window that lends none refuses: `This window cannot host 'sdl3': it lends … It can host: …`.
 
 ## Staged windows
 
