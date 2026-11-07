@@ -103,6 +103,12 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
 
     private const int COPY = 4;
 
+    private const int ROUND = 5;
+
+    private const int SHADE = 6;
+
+    private const int GLYPH = 7;
+
     private SDL_GPUDevice $gpu;
 
     private readonly bool $owns_gpu;
@@ -131,6 +137,9 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
     private ?SDL_GPUSampler $sampler = null;
 
     private ?SDL_GPUTexture $blank = null;
+
+    /** @var array<int, SDL_GPUTexture> Glyph atlases (R8) by number, kept across draws until remade or released. */
+    private array $atlases = [];
 
     /**
      * Fences of the command buffers submitted, held until a later submit has
@@ -390,11 +399,32 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         }
     }
 
+    /** The operations draw() handles. */
+    private const array OPS = [Op::CLEAR, Op::SCISSOR, Op::SOLID, Op::STENCIL_FILL, Op::COVER, Op::RECTS, Op::ELLIPSE, Op::RING, Op::UPLOAD, Op::IMAGE, Op::ATLAS, Op::MASK, Op::GLYPHS, Op::ROUNDRECT, Op::ROUNDRING, Op::SHADOW];
+
+    /**
+     * Every operation of $list is one draw() handles: checked before any GPU work, so an unknown one fails the
+     * frame loudly instead of being skipped.
+     *
+     * @throws DrawingException On the first operation it does not handle.
+     */
+    private static function known(DrawList $list): void
+    {
+        foreach ($list->operations as $operation) {
+            if (! in_array($operation[0], self::OPS, true)) {
+                $op = $operation[0] instanceof Op ? $operation[0]->name : get_debug_type($operation[0]);
+
+                throw new DrawingException("sdl3: unknown draw op {$op}");
+            }
+        }
+    }
+
     public function draw(DrawList $list): void
     {
         $target = $this->framebuffer ?? throw new DrawingException('sdl3: target() comes before draw().');
         $width = $target->width();
         $height = $target->height();
+        self::known($list);
 
         // The list's vertices, then one quad over the whole target for CLEAR and the restore.
         $whole = $list->vertexCount();
@@ -408,6 +438,18 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
                 foreach ($list->operations as $operation) {
                     if ($operation[0] === Op::UPLOAD) {
                         $textures[$operation[1]] = $this->upload($commands, $operation[2]);
+                    } elseif ($operation[0] === Op::ATLAS) {
+                        // A new texture's bytes are undefined: zero it. SDL keeps the old one while a frame reads it.
+                        [, $atlas, $atlasWidth, $atlasHeight] = $operation;
+                        $made = $this->texture(SDL_GPU_TEXTUREFORMAT_R8_UNORM, $atlasWidth, $atlasHeight, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                        if (isset($this->atlases[$atlas])) {
+                            SDL_ReleaseGPUTexture($this->gpu, $this->atlases[$atlas]);
+                        }
+                        $this->atlases[$atlas] = $made;
+                        $this->uploadRegion($commands, $made, Region::wholeSurface($atlasWidth, $atlasHeight), str_repeat("\0", $atlasWidth * $atlasHeight));
+                    } elseif ($operation[0] === Op::MASK) {
+                        // Only regions no earlier frame drew from: frames in flight read what they read before.
+                        $this->uploadRegion($commands, $this->atlases[$operation[1]], $operation[2], $operation[3]);
                     }
                 }
                 if ($this->stale) {
@@ -470,6 +512,42 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
                             break;
 
                         case Op::UPLOAD:
+                        case Op::ATLAS:
+                        case Op::MASK:
+                            break;
+
+                        case Op::GLYPHS:
+                            // The texels come from the frame's vertices again: slot 1, offset so vertex k reads $texels + k.
+                            [, $first, $count, $texels, $atlas, $rgba] = $operation;
+                            SDL_BindGPUGraphicsPipeline($pass, $this->pipeline('fill'));
+                            $this->bindTexture($pass, $this->atlases[$atlas]);
+                            $this->uniforms($commands, self::paintBytes(self::GLYPH, $rgba));
+                            $texelBinding = new SDL_GPUBufferBinding();
+                            $texelBinding->buffer = $buffer;
+                            $texelBinding->offset = ($texels - $first) * 8;
+                            SDL_BindGPUVertexBuffers($pass, 1, [$texelBinding]);
+                            SDL_DrawGPUPrimitives($pass, $count, 1, $first, 0);
+                            $texelBinding->offset = 0;
+                            SDL_BindGPUVertexBuffers($pass, 1, [$texelBinding]);
+                            $this->bindTexture($pass, $this->blank());
+                            break;
+
+                        case Op::ROUNDRECT:
+                        case Op::ROUNDRING:
+                            $ring = $operation[0] === Op::ROUNDRING;
+                            [, $first, $x0, $y0, $x1, $y1, $r] = $operation;
+                            SDL_BindGPUGraphicsPipeline($pass, $this->pipeline('fill'));
+                            $this->uniforms($commands, self::paintBytes(self::ROUND, $operation[$ring ? 8 : 7], shape: [$x0, $y0, $x1, $y1],
+                                band: [$ring ? (float) $operation[7] : 0.0, $ring ? 1.0 : 0.0, (float) $this->samples, 0.0],
+                                radii: [(float) $r[0], (float) $r[1], (float) $r[2], (float) $r[3]]));
+                            SDL_DrawGPUPrimitives($pass, 6, 1, $first, 0);
+                            break;
+
+                        case Op::SHADOW:
+                            [, $first, $x0, $y0, $x1, $y1, $radius, $blur, $rgba] = $operation;
+                            SDL_BindGPUGraphicsPipeline($pass, $this->pipeline('fill'));
+                            $this->uniforms($commands, self::paintBytes(self::SHADE, $rgba, shape: [$x0, $y0, $x1, $y1], band: [(float) $blur, (float) $radius, (float) $this->samples, 0.0]));
+                            SDL_DrawGPUPrimitives($pass, 6, 1, $first, 0);
                             break;
 
                         case Op::IMAGE:
@@ -739,6 +817,10 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
             SDL_ReleaseGPUTexture($this->gpu, $texture);
         }
         $this->owned = [];
+        foreach ($this->atlases as $texture) {
+            SDL_ReleaseGPUTexture($this->gpu, $texture);
+        }
+        $this->atlases = [];
         $this->framebuffer = null;
         if (! is_null($this->sampler)) {
             SDL_ReleaseGPUSampler($this->gpu, $this->sampler);
@@ -778,7 +860,8 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         SDL_SetGPUViewport($pass, $viewport);
         $binding = new SDL_GPUBufferBinding();
         $binding->buffer = $buffer;
-        SDL_BindGPUVertexBuffers($pass, 0, [$binding]);
+        // Slot 1 carries GLYPHS' texels; every other draw leaves it at offset 0 and reads nothing from it.
+        SDL_BindGPUVertexBuffers($pass, 0, [$binding, $binding]);
         $frame = pack('g4', (float) $width, (float) $height, 0.0, 0.0);
         SDL_PushGPUVertexUniformData($commands, 0, $frame, strlen($frame));
         // The fragment program declares a sampler: every draw needs one bound, read or not.
@@ -877,6 +960,24 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         }
     }
 
+    /** $bytes (tightly packed, rows top-down) into $region of $texture, in a copy pass of this command buffer. */
+    private function uploadRegion(SDL_GPUCommandBuffer $commands, SDL_GPUTexture $texture, Region $region, string $bytes): void
+    {
+        $staging = $this->transferBuffer(strlen($bytes), SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
+        try {
+            $this->fillTransfer($staging, $bytes);
+            $copy = SDL_BeginGPUCopyPass($commands) ?? throw new DrawingException('sdl3: no copy pass could begin: '.SDL_GetError());
+            $from = new SDL_GPUTextureTransferInfo();
+            $from->transfer_buffer = $staging;
+            $from->pixels_per_row = $region->width;
+            $from->rows_per_layer = $region->height;
+            SDL_UploadToGPUTexture($copy, $from, self::region($texture, $region), false);
+            SDL_EndGPUCopyPass($copy);
+        } finally {
+            SDL_ReleaseGPUTransferBuffer($this->gpu, $staging);
+        }
+    }
+
     /** An image source as a sampled RGBA8 texture, uploaded in a copy pass of this command buffer. */
     private function upload(SDL_GPUCommandBuffer $commands, Framebuffer $source): SDL_GPUTexture
     {
@@ -944,8 +1045,17 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         $attribute->location = 0;
         $attribute->buffer_slot = 0;
         $attribute->format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2;
-        $info->vertex_input_state->vertex_buffer_descriptions = [$description];
-        $info->vertex_input_state->vertex_attributes = [$attribute];
+        // The same vertex buffer again in slot 1: the atlas texel of GLYPHS (location 1).
+        $texels = new SDL_GPUVertexBufferDescription();
+        $texels->slot = 1;
+        $texels->pitch = 8;
+        $texels->input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX;
+        $texel = new SDL_GPUVertexAttribute();
+        $texel->location = 1;
+        $texel->buffer_slot = 1;
+        $texel->format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2;
+        $info->vertex_input_state->vertex_buffer_descriptions = [$description, $texels];
+        $info->vertex_input_state->vertex_attributes = [$attribute, $texel];
 
         $info->rasterizer_state->fill_mode = SDL_GPU_FILLMODE_FILL;
         $info->rasterizer_state->cull_mode = SDL_GPU_CULLMODE_NONE;
@@ -991,19 +1101,20 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
     }
 
     /**
-     * The Paint block, 96 bytes: mode_rgba[0] = mode, opacity, linear, flags;
-     * mode_rgba[1] = r, g, b, a; shape; band; abcd; efwh.
+     * The Paint block, 112 bytes: mode_rgba[0] = mode, opacity, linear, flags;
+     * mode_rgba[1] = r, g, b, a; shape; band; abcd; efwh; radii.
      *
      * @param  array{float, float, float, float}  $shape
      * @param  array{float, float, float, float}  $band
      * @param  array{float, float, float, float}  $abcd
      * @param  array{float, float, float, float}  $efwh
+     * @param  array{float, float, float, float}  $radii
      */
-    private static function paintBytes(int $mode, int $rgba, int $opacity = 255, int $linear = 0, array $shape = [0.0, 0.0, 0.0, 0.0], array $band = [0.0, 0.0, 0.0, 0.0], array $abcd = [0.0, 0.0, 0.0, 0.0], array $efwh = [0.0, 0.0, 0.0, 0.0], int $flags = 0): string
+    private static function paintBytes(int $mode, int $rgba, int $opacity = 255, int $linear = 0, array $shape = [0.0, 0.0, 0.0, 0.0], array $band = [0.0, 0.0, 0.0, 0.0], array $abcd = [0.0, 0.0, 0.0, 0.0], array $efwh = [0.0, 0.0, 0.0, 0.0], int $flags = 0, array $radii = [0.0, 0.0, 0.0, 0.0]): string
     {
         return pack('V4', $mode, $opacity, $linear, $flags)
             .pack('V4', ($rgba >> 24) & 0xFF, ($rgba >> 16) & 0xFF, ($rgba >> 8) & 0xFF, $rgba & 0xFF)
-            .pack('g4', ...$shape).pack('g4', ...$band).pack('g4', ...$abcd).pack('g4', ...$efwh);
+            .pack('g4', ...$shape).pack('g4', ...$band).pack('g4', ...$abcd).pack('g4', ...$efwh).pack('g4', ...$radii);
     }
 
     /** Six vertices: x0,y0 x1,y0 x1,y1 x0,y0 x1,y1 x0,y1, as Lowering lays a quad. */

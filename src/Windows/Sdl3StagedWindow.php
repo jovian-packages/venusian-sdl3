@@ -12,9 +12,12 @@ use SDL_GLContext;
 use SDL_MetalView;
 use SDL_Point;
 use SDL_Rect;
+use SDL_Event;
 use SDL_Surface;
 use SDL_Window;
 use SDL_WindowEvent;
+use Jovian\Engines\Sdl3\Input\ScancodeMap;
+use Jovian\Engines\Sdl3\Input\Sdl3InputEngine;
 use Surface\Contracts\Drawing\LentSurface;
 use Surface\Contracts\Drawing\SurfaceBorrower;
 use Surface\Contracts\Drawing\SurfaceKind;
@@ -214,9 +217,35 @@ class Sdl3StagedWindow extends StagedWindow
             SDL_EVENT_WINDOW_ENTER_FULLSCREEN, SDL_EVENT_WINDOW_LEAVE_FULLSCREEN, SDL_EVENT_WINDOW_SHOWN => $this->syncMode(),
             SDL_EVENT_WINDOW_DISPLAY_CHANGED => $this->displayChanged($event->data1),
             SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED => $this->scaleChanged($this->nativeScale()),
+            SDL_EVENT_WINDOW_MOUSE_ENTER => $this->pointerEntered(),
+            SDL_EVENT_WINDOW_MOUSE_LEAVE => $this->pointerLeft(),
             SDL_EVENT_WINDOW_CLOSE_REQUESTED => $this->closeRequested(),
             default => null,
         };
+    }
+
+    /** One SDL key or text event for this window, routed here by the session. */
+    public function input(SDL_Event $event): void
+    {
+        match ($event->type) {
+            SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP => $this->keyEvent($event->key),
+            SDL_EVENT_TEXT_INPUT => $this->textCommitted($event->text->text),
+            default => null,
+        };
+    }
+
+    /** The key's layout character is SDL's keycode when that is printable text, else ''. */
+    private function keyEvent(\SDL_KeyboardEvent $event): void
+    {
+        $modifiers = Sdl3InputEngine::modifiers($event->mod);
+        $key = ScancodeMap::key($event->scancode);
+        if (! $event->down) {
+            $this->keyReleased($key, $modifiers);
+
+            return;
+        }
+        $printable = $event->key >= 0x20 && $event->key !== 0x7f && $event->key < 0x40000000;
+        $this->keyPressed($key, $printable ? mb_chr($event->key) : '', $modifiers, $event->repeat);
     }
 
     public function surfaces(): array

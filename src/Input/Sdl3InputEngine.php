@@ -184,12 +184,18 @@ final class Sdl3InputEngine implements InputEngineDriver, InputTap
             return;
         }
 
-        $this->keyboard->update(ScancodeMap::key($event->code), $event->down)->setModifiers(new Modifiers(
-            shift: ($event->mod & SDL_KMOD_SHIFT) !== 0,
-            ctrl: ($event->mod & SDL_KMOD_CTRL) !== 0,
-            alt: ($event->mod & SDL_KMOD_ALT) !== 0,
-            meta: ($event->mod & SDL_KMOD_GUI) !== 0,
-        ));
+        $this->keyboard->update(ScancodeMap::key($event->code), $event->down)->setModifiers(self::modifiers($event->mod));
+    }
+
+    /** SDL's SDL_Keymod bits as Surface modifiers. */
+    public static function modifiers(int $mod): Modifiers
+    {
+        return new Modifiers(
+            shift: ($mod & SDL_KMOD_SHIFT) !== 0,
+            ctrl: ($mod & SDL_KMOD_CTRL) !== 0,
+            alt: ($mod & SDL_KMOD_ALT) !== 0,
+            meta: ($mod & SDL_KMOD_GUI) !== 0,
+        );
     }
 
     private function motion(SeenEvent $event, string $window): void

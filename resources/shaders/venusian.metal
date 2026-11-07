@@ -1,22 +1,26 @@
 #include <metal_stdlib>
 using namespace metal;
 
-struct PointIn { float2 point [[attribute(0)]]; };
-struct VOut { float4 position [[position]]; float2 at; };
+struct PointIn { float2 point [[attribute(0)]]; float2 texel [[attribute(1)]]; };
+struct VOut { float4 position [[position]]; float2 at; float2 atlas_at; };
 struct Frame { float4 size; };
-struct Paint { uint4 mode_rgba[2]; float4 shape; float4 band; float4 abcd; float4 efwh; };
+struct Paint { uint4 mode_rgba[2]; float4 shape; float4 band; float4 abcd; float4 efwh; float4 radii; };
 
 constant uint SOLID = 0;
 constant uint FILL = 1;
 constant uint OVAL = 2;
 constant uint IMAGE = 3;
 constant uint COPY = 4;
+constant uint ROUND = 5;
+constant uint SHADE = 6;
+constant uint GLYPH = 7;
 
 vertex VOut place(PointIn in [[stage_in]], constant Frame &frame [[buffer(0)]])
 {
     VOut out;
     out.position = float4(in.point.x / frame.size.x * 2.0 - 1.0, 1.0 - in.point.y / frame.size.y * 2.0, 0.0, 1.0);
     out.at = in.point;
+    out.atlas_at = in.texel;
     return out;
 }
 
@@ -31,6 +35,48 @@ static float ellipse(float2 p, float2 centre, float2 radii, bool hard)
     float2 q = (p - centre) / radii;
     float d = (length(q) - 1.0) * min(radii.x, radii.y);
     return hard ? (d <= 0.0 ? 1.0 : 0.0) : clamp(0.5 - d, 0.0, 1.0);
+}
+
+// As venusian.frag: Rasterize's roundAcross(), and a rounded box's coverage at a pixel.
+static float corner(float cx, float cy, float r, float y, float side)
+{
+    float t = (y - cy) / r;
+    float h = r * sqrt(max(0.0, 1.0 - t * t));
+    return side < 0.0 ? cx - h : cx + h;
+}
+
+static float2 across(float4 box, float4 r, float y)
+{
+    if (y < box.y || y >= box.w) {
+        return float2(0.0);
+    }
+    float left = box.x;
+    if (y < box.y + r.x) {
+        left = corner(box.x + r.x, box.y + r.x, r.x, y, -1.0);
+    } else if (y > box.w - r.w) {
+        left = corner(box.x + r.w, box.w - r.w, r.w, y, -1.0);
+    }
+    float right = box.z;
+    if (y < box.y + r.y) {
+        right = corner(box.z - r.y, box.y + r.y, r.y, y, 1.0);
+    } else if (y > box.w - r.z) {
+        right = corner(box.z - r.z, box.w - r.z, r.z, y, 1.0);
+    }
+    return float2(left, right);
+}
+
+static float roundbox(float2 p, float4 box, float4 r, bool hard)
+{
+    if (hard) {
+        float2 ends = across(box, r, p.y);
+        return ends.y > ends.x && p.x >= ends.x && p.x < ends.y ? 1.0 : 0.0;
+    }
+    float2 c = (box.xy + box.zw) / 2.0;
+    float2 h = (box.zw - box.xy) / 2.0;
+    float k = p.x < c.x ? (p.y < c.y ? r.x : r.w) : (p.y < c.y ? r.y : r.z);
+    float2 q = abs(p - c) - h + k;
+    float d = min(max(q.x, q.y), 0.0) + length(max(q, float2(0.0))) - k;
+    return clamp(0.5 - d, 0.0, 1.0);
 }
 
 static float3 linear_light(float3 c)
@@ -53,6 +99,51 @@ fragment float4 paint(VOut in [[stage_in]], constant Paint &p [[buffer(0)]], tex
     }
     if (mode == SOLID || mode == FILL) {
         c = rgba;
+    } else if (mode == ROUND) {
+        bool hard = p.band.z < 2.0;
+        float coverage = roundbox(centre, p.shape, p.radii, hard);
+        if (p.band.y > 0.5) {
+            float inset = p.band.x;
+            float4 hole = float4(p.shape.xy + inset, p.shape.zw - inset);
+            if (hole.z > hole.x && hole.w > hole.y) {
+                coverage -= roundbox(centre, hole, max(p.radii - inset, float4(0.0)), hard);
+            }
+        }
+        if (coverage <= 0.0) {
+            discard_fragment();
+        }
+        c = float4(rgba.rgb, shaped(p.mode_rgba[1].w, coverage));
+    } else if (mode == SHADE) {
+        float2 bc = (p.shape.xy + p.shape.zw) / 2.0;
+        float2 bh = (p.shape.zw - p.shape.xy) / 2.0;
+        float r = p.band.y;
+        float blur = p.band.x;
+        float2 q = abs(centre - bc) - bh + r;
+        float2 o = max(q, float2(0.0));
+        float d = min(max(q.x, q.y), 0.0) + sqrt(o.x * o.x + o.y * o.y) - r;
+        float cover;
+        if (blur > 0.0) {
+            float t = clamp((d + blur) / (2.0 * blur), 0.0, 1.0);
+            cover = 1.0 - t * t * (3.0 - 2.0 * t);
+        } else {
+            cover = d < 0.0 ? 1.0 : 0.0;
+        }
+        uint v = uint(floor(cover * 255.0 + 0.5));
+        if (p.band.z < 2.0) {
+            v = v >= 128u ? 255u : 0u;
+        }
+        uint a = (p.mode_rgba[1].w * v + 127u) / 255u;
+        if (a == 0u) {
+            discard_fragment();
+        }
+        c = float4(rgba.rgb, float(a) / 255.0);
+    } else if (mode == GLYPH) {
+        uint cv = uint(round(source.read(uint2(floor(in.atlas_at))).r * 255.0));
+        uint a = (p.mode_rgba[1].w * cv + 127u) / 255u;
+        if (a == 0u) {
+            discard_fragment();
+        }
+        c = float4(rgba.rgb, float(a) / 255.0);
     } else if (mode == OVAL) {
         bool hard = p.band.z < 2.0;
         float half_stroke = p.band.x / 2.0;

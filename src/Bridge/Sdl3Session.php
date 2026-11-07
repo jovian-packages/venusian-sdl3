@@ -78,6 +78,8 @@ class Sdl3Session extends BridgedToolkitSession
                 $displays = true;
             } elseif ($event->type >= SDL_EVENT_WINDOW_FIRST && $event->type <= SDL_EVENT_WINDOW_LAST) {
                 ($this->windows[$event->window->windowID] ?? null)?->handle($event->window);
+            } else {
+                ($this->windows[self::windowOf($event)] ?? null)?->input($event);
             }
             $got = SDL_PollEvent($event);
         }
@@ -86,6 +88,16 @@ class Sdl3Session extends BridgedToolkitSession
         }
 
         return $dispatched;
+    }
+
+    /** The SDL window id a key or text event is for; 0 for any other event. */
+    private static function windowOf(SDL_Event $event): int
+    {
+        return match ($event->type) {
+            SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP => $event->key->windowID,
+            SDL_EVENT_TEXT_INPUT => $event->text->windowID,
+            default => 0,
+        };
     }
 
     public function attach(int $windowId, Sdl3StagedWindow $window): void
