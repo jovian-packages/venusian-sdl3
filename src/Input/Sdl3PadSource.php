@@ -12,7 +12,6 @@ use Surface\Contracts\HumanInput\PadSource;
 use Surface\HumanInput\Devices\GameController;
 use Surface\HumanInput\Devices\GamePad;
 use Surface\HumanInput\InputFrame;
-use ValueError;
 
 /**
  * SDL's game pads and joysticks, read by polling: no window and no event needed.
@@ -334,14 +333,10 @@ final class Sdl3PadSource implements PadSource
         return $serial;
     }
 
-    /** A close, unless SDL_Quit already closed the device and released its handle. */
+    /** A close. A handle SDL_Quit already released reaches SDL as NULL, which SDL ignores. */
     private static function close(callable $close): void
     {
-        try {
-            $close();
-        } catch (ValueError) {
-            // The handle was released when SDL took the joystick subsystem down: nothing left to close.
-        }
+        $close();
     }
 
     private static function sdlButton(GamepadButton $button): int

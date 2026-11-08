@@ -3,8 +3,11 @@
 namespace Jovian\Engines\Sdl3;
 
 use Closure;
+use FbBuffer;
+use FbFormat;
 use SDL_FColor;
 use SDL_GPUBlitInfo;
+use Surface\Drawing\Gpu\FilterPlan;
 use SDL_GPUBuffer;
 use SDL_GPUBufferBinding;
 use SDL_GPUBufferCreateInfo;
@@ -48,6 +51,7 @@ use Surface\Contracts\Framebuffers\Region;
 use Surface\Contracts\Rasterize\FillRule;
 use Surface\Contracts\Windows\ScaleFilter;
 use Surface\Drawing\Gpu\DrawList;
+use Surface\Drawing\Gpu\DrawsGlass;
 use Surface\Drawing\Gpu\GpuDevice;
 use Surface\Drawing\Gpu\Op;
 use Surface\Drawing\Gpu\QueuesFrames;
@@ -85,7 +89,7 @@ use Throwable;
  * SDR white level; HDR10 shows through HDR10_ST2084, the show pass encoding
  * BT.2020 PQ. SDL_GPU has no P3 composition and takes no HDR metadata.
  */
-final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, TargetsFormats
+final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, TargetsFormats, DrawsGlass
 {
     /** The shader directory: GLSL with its compiled SPIR-V, and MSL. */
     public const string SHADERS = __DIR__.'/../resources/shaders';
@@ -108,6 +112,10 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
     private const int SHADE = 6;
 
     private const int GLYPH = 7;
+
+    private const int GRADIENT = 8;
+
+    private const int GLASS = 9;
 
     private SDL_GPUDevice $gpu;
 
@@ -136,7 +144,32 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
 
     private ?SDL_GPUSampler $sampler = null;
 
+    /** @var array<int, array{resolved: SDL_GPUTexture, multisampled: ?SDL_GPUTexture, stencil: SDL_GPUTexture}> Layer targets by number (1 up): made on first use at the target's size, kept until it changes. */
+    private array $slots = [];
+
+    /** The filter program: its pipeline, made on the first chain. */
+    private ?SDL_GPUGraphicsPipeline $filterPipeline = null;
+
+    /** @var array<int, SDL_GPUShader> The filter program's shaders, by stage. */
+    private array $filterShaders = [];
+
     private ?SDL_GPUTexture $blank = null;
+
+    /** The glass passes' fragment shader and pipeline (the filter's vertex stage, one sampler): made on the first glass pane. */
+    private ?SDL_GPUShader $glassShader = null;
+
+    private ?SDL_GPUGraphicsPipeline $glassPipeline = null;
+
+    /** Pyramid levels no frame holds, by size, to be taken again; over GLASS_POOL_BYTES the sizes used longest ago are released first. */
+    private const int GLASS_POOL_BYTES = 134217728;
+
+    /** @var array<string, list<SDL_GPUTexture>> Textures by "WxH". */
+    private array $glassPool = [];
+
+    private int $glassBytes = 0;
+
+    /** @var array<int, array<string, mixed>> The last frame's glass pyramids by their place in the frame, kept while Lowering says nothing under them changed. */
+    private array $glassKept = [];
 
     /** @var array<int, SDL_GPUTexture> Glyph atlases (R8) by number, kept across draws until remade or released. */
     private array $atlases = [];
@@ -255,7 +288,8 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
             $info->entrypoint = $fragment ? 'paint' : 'place';
         }
         $info->num_uniform_buffers = 1;
-        $info->num_samplers = $fragment ? 1 : 0;
+        // the source, and a glass pane's sharp capture: every draw binds both
+        $info->num_samplers = $fragment ? 2 : 0;
 
         return $this->shaders[$stage] = SDL_CreateGPUShader($this->gpu, $info)
             ?? throw new DrawingException('sdl3: the '.($fragment ? 'fragment' : 'vertex').' shader was refused: '.SDL_GetError());
@@ -285,7 +319,7 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
 
         // Defined contents from the start: transparent black, as a new framebuffer holds.
         $this->encode(function (SDL_GPUCommandBuffer $commands): void {
-            $pass = SDL_BeginGPURenderPass($commands, [$this->colorTarget(SDL_GPU_LOADOP_CLEAR)], $this->stencilTarget())
+            $pass = SDL_BeginGPURenderPass($commands, [$this->colorTarget(SDL_GPU_LOADOP_CLEAR)], 1, $this->stencilTarget())
                 ?? throw new DrawingException('sdl3: no render pass could begin: '.SDL_GetError());
             SDL_EndGPURenderPass($pass);
         });
@@ -342,12 +376,14 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
             if ($address === 0) {
                 throw new DrawingException('sdl3: the readback buffer could not be mapped: '.SDL_GetError());
             }
+            // ext-sdl3's SDL_ReadIO writes to an address: an ext-fb buffer of the region's rows ($bytes/4 RGBA8 cells a texel) takes them.
+            $rows = new FbBuffer(new FbFormat(FB_LAYOUT_RGBA8888, channelOrder: FB_CHANNELS_RGBA), $region->width * intdiv($bytes, 4), $region->height);
             $io = SDL_IOFromConstMem($address, $size);
-            $bytes = SDL_ReadIO($io, $size);
+            SDL_ReadIO($io, $rows->pointer(), $size);
             SDL_CloseIO($io);
             SDL_UnmapGPUTransferBuffer($this->gpu, $download);
 
-            return $bytes;
+            return $rows->bytes();
         } finally {
             SDL_ReleaseGPUTransferBuffer($this->gpu, $download);
         }
@@ -395,12 +431,12 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
     public function finish(): void
     {
         if ($this->pending !== []) {
-            SDL_WaitForGPUFences($this->gpu, true, $this->pending);
+            SDL_WaitForGPUFences($this->gpu, true, $this->pending, count($this->pending));
         }
     }
 
     /** The operations draw() handles. */
-    private const array OPS = [Op::CLEAR, Op::SCISSOR, Op::SOLID, Op::STENCIL_FILL, Op::COVER, Op::RECTS, Op::ELLIPSE, Op::RING, Op::UPLOAD, Op::IMAGE, Op::ATLAS, Op::MASK, Op::GLYPHS, Op::ROUNDRECT, Op::ROUNDRING, Op::SHADOW];
+    private const array OPS = [Op::CLEAR, Op::SCISSOR, Op::SOLID, Op::STENCIL_FILL, Op::COVER, Op::COVER_GRADIENT, Op::RECTS, Op::ELLIPSE, Op::RING, Op::UPLOAD, Op::IMAGE, Op::ATLAS, Op::MASK, Op::GLYPHS, Op::ROUNDRECT, Op::ROUNDRING, Op::SHADOW, Op::TARGET, Op::BACKDROP, Op::FILTER, Op::LAYER_SOURCE, Op::GLASS_BACKDROP, Op::GLASS];
 
     /**
      * Every operation of $list is one draw() handles: checked before any GPU work, so an unknown one fails the
@@ -432,8 +468,12 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         $buffer = $this->vertexBuffer($vertices);
         /** @var array<int, SDL_GPUTexture> $textures */
         $textures = [];
+        /** @var array<int, true> $layerTextures The layer targets among $textures, by object id: the device keeps them. */
+        $layerTextures = [];
+        /** @var list<SDL_GPUTexture> $scratch The frame's filter textures, let go with it. */
+        $scratch = [];
         try {
-            $this->encode(function (SDL_GPUCommandBuffer $commands) use ($list, $buffer, $vertices, $whole, $width, $height, &$textures): void {
+            $this->encode(function (SDL_GPUCommandBuffer $commands) use ($list, $buffer, $vertices, $whole, $width, $height, &$textures, &$layerTextures, &$scratch): void {
                 $this->uploadVertices($commands, $buffer, $vertices);
                 foreach ($list->operations as $operation) {
                     if ($operation[0] === Op::UPLOAD) {
@@ -452,17 +492,196 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
                         $this->uploadRegion($commands, $this->atlases[$operation[1]], $operation[2], $operation[3]);
                     }
                 }
+                // Layers: their targets, and for each filter chain an image a pass to render into, the pass's numbers uploaded.
+                /** @var array<int, array{list<array<string, mixed>>, list<SDL_GPUTexture>, list<?SDL_GPUTexture>}> $filters By the operation's place in the list. */
+                $filters = [];
+                foreach ($list->operations as $index => $operation) {
+                    switch ($operation[0]) {
+                        case Op::TARGET:
+                        case Op::FILTER:
+                        case Op::GLASS_BACKDROP:
+                            $this->ensureSlot($operation[1]);
+                            break;
+                        case Op::BACKDROP:
+                            $this->ensureSlot($operation[1]);
+                            $this->ensureSlot($operation[2]);
+                            break;
+                        case Op::LAYER_SOURCE:
+                            $this->ensureSlot($operation[2]);
+                            $textures[$operation[1]] = $this->slots[$operation[2]]['resolved'];
+                            $layerTextures[spl_object_id($textures[$operation[1]])] = true;
+                            break;
+                    }
+                    if ($operation[0] !== Op::FILTER) {
+                        continue;
+                    }
+                    [, , $region, $chain, $premultiplied, $maps, $tables] = $operation;
+                    $plan = FilterPlan::of($chain, $premultiplied, $maps, $tables, $region->width, $region->height);
+                    $outputs = [];
+                    $numbers = [];
+                    foreach ($plan as $pass) {
+                        $outputs[] = $scratch[] = $this->texture($this->colorFormat, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                        $data = null;
+                        if ($pass['data'] !== []) {
+                            $rows = intdiv(count($pass['data']) + 511, 512);
+                            $data = $scratch[] = $this->texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 512, $rows, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+                            $this->uploadRegion($commands, $data, new Region(0, 0, 512, $rows), pack('g*', ...array_pad($pass['data'], $rows * 512, 0.0)));
+                        }
+                        $numbers[] = $data;
+                    }
+                    $filters[$index] = [$plan, $outputs, $numbers];
+                }
+
+                // Glass: each backdrop's pyramid, new or last frame's.
+                /** @var array<int, array{array<string, mixed>, bool}> $glass By the operation's place in the list: the pyramid, and whether this frame builds it. */
+                $glass = [];
+                $glassUsed = [];
+                foreach ($list->operations as $index => $operation) {
+                    if ($operation[0] !== Op::GLASS_BACKDROP) {
+                        continue;
+                    }
+                    [, $from, $region, $depths, $n, $keep] = $operation;
+                    $glassUsed[$n] = true;
+                    if ($keep && isset($this->glassKept[$n])) {
+                        $glass[$index] = [$this->glassKept[$n], false];
+
+                        continue;
+                    }
+                    if (isset($this->glassKept[$n])) {
+                        $this->glassDiscard($this->glassKept[$n]);
+                        unset($this->glassKept[$n]);
+                    }
+                    $this->glassKept[$n] = $pyramid = $this->glassBuild($this->slotTexture($from), $region, $depths);
+                    $glass[$index] = [$pyramid, true];
+                }
+                foreach (array_diff_key($this->glassKept, $glassUsed) as $n => $kept) {
+                    $this->glassDiscard($kept);
+                    unset($this->glassKept[$n]);
+                }
+
                 if ($this->stale) {
                     $this->restore($commands, $buffer, $whole, $width, $height);
                 }
 
-                $pass = SDL_BeginGPURenderPass($commands, [$this->colorTarget(SDL_GPU_LOADOP_LOAD)], $this->stencilTarget())
-                    ?? throw new DrawingException('sdl3: no render pass could begin: '.SDL_GetError());
-                $this->prepare($pass, $commands, $buffer, $width, $height);
-                $scissor = self::rect(0, 0, $width, $height);
+                $begin = function (int $slot, int $load) use ($commands, $buffer, $width, $height): SDL_GPURenderPass {
+                    $pass = SDL_BeginGPURenderPass($commands, [$this->colorTarget($load, $slot)], 1, $this->stencilTarget($slot))
+                        ?? throw new DrawingException('sdl3: no render pass could begin: '.SDL_GetError());
+                    $this->prepare($pass, $commands, $buffer, $width, $height);
 
-                foreach ($list->operations as $operation) {
+                    return $pass;
+                };
+                $pass = $begin(0, SDL_GPU_LOADOP_LOAD);
+                $scissor = self::rect(0, 0, $width, $height);
+                $current = 0;
+                $panes = null;
+
+                foreach ($list->operations as $index => $operation) {
                     switch ($operation[0]) {
+                        case Op::TARGET:
+                            // draws go to another target from here: a layer's own (cleared), or back to an enclosing one
+                            [, $current, $cleared] = $operation;
+                            SDL_EndGPURenderPass($pass);
+                            $pass = $begin($current, is_null($cleared) ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR);
+                            $scissor = self::rect(0, 0, $width, $height);
+                            break;
+
+                        case Op::BACKDROP:
+                            // [, $from, $into, $region]: the region of one target copied into another, no blending
+                            [, $from, $into, $region] = $operation;
+                            SDL_EndGPURenderPass($pass);
+                            $this->blit($commands, $this->slotTexture($from), $this->slotTexture($into), $region, $region);
+                            $pass = $begin($current, SDL_GPU_LOADOP_LOAD);
+                            SDL_SetGPUScissor($pass, $scissor);
+                            break;
+
+                        case Op::FILTER:
+                            SDL_EndGPURenderPass($pass);
+                            [$plan, $outputs, $numbers] = $filters[$index];
+                            [, $into, $region] = $operation;
+                            $results = [0 => $this->slotTexture($into)];
+                            foreach ($outputs as $i => $output) {
+                                $results[$i + 1] = $output;
+                            }
+                            foreach ($plan as $i => $filterPass) {
+                                $color = new SDL_GPUColorTargetInfo();
+                                $color->texture = $outputs[$i];
+                                $color->load_op = SDL_GPU_LOADOP_DONT_CARE;
+                                $color->store_op = SDL_GPU_STOREOP_STORE;
+                                $fp = SDL_BeginGPURenderPass($commands, [$color], 1, null)
+                                    ?? throw new DrawingException('sdl3: no render pass could begin: '.SDL_GetError());
+                                SDL_BindGPUGraphicsPipeline($fp, $this->filterPipeline());
+                                SDL_SetGPUScissor($fp, self::rect($region->x, $region->y, $region->width, $region->height));
+                                $bindings = [];
+                                foreach ([$results[$filterPass['in']], $results[$filterPass['in2']], $numbers[$i] ?? $this->blank(), $filterPass['map'] < 0 ? $this->blank() : $textures[$filterPass['map']]] as $texture) {
+                                    $binding = new SDL_GPUTextureSamplerBinding();
+                                    $binding->texture = $texture;
+                                    $binding->sampler = $this->sampler();
+                                    $bindings[] = $binding;
+                                }
+                                SDL_BindGPUFragmentSamplers($fp, 0, $bindings, 4);
+                                $p = array_pad($filterPass['params'], 8, 0.0);
+                                $uniform = pack('g16', (float) $region->x, (float) $region->y, (float) $region->right(), (float) $region->bottom(), (float) $filterPass['kind'], 0.0, 0.0, 0.0, $p[0], $p[1], $p[2], $p[3], $p[4], $p[5], $p[6], $p[7]);
+                                SDL_PushGPUFragmentUniformData($commands, 0, $uniform, strlen($uniform));
+                                SDL_DrawGPUPrimitives($fp, 3, 1, 0, 0);
+                                SDL_EndGPURenderPass($fp);
+                            }
+                            // the last result's region into the target: what the target holds from here is the answer
+                            $this->blit($commands, $outputs[count($plan) - 1], $this->slotTexture($into), $region, $region);
+                            $pass = $begin($current, SDL_GPU_LOADOP_LOAD);
+                            SDL_SetGPUScissor($pass, $scissor);
+                            break;
+
+                        case Op::LAYER_SOURCE:
+                            // the target's texture is bound as the image's source by the IMAGE that follows
+                            break;
+
+                        case Op::GLASS_BACKDROP:
+                            // the region read once and taken down and up the pyramid, in passes of their own; a kept pyramid is as it was
+                            [$pyramid, $builds] = $glass[$index];
+                            $panes = $pyramid;
+                            if (! $builds) {
+                                break;
+                            }
+                            SDL_EndGPURenderPass($pass);
+                            foreach ($pyramid['passes'] as [$kind, $input, $out, $a, $b]) {
+                                $color = new SDL_GPUColorTargetInfo();
+                                $color->texture = $out;
+                                $color->load_op = SDL_GPU_LOADOP_DONT_CARE;
+                                $color->store_op = SDL_GPU_STOREOP_STORE;
+                                $gp = SDL_BeginGPURenderPass($commands, [$color], 1, null)
+                                    ?? throw new DrawingException('sdl3: no render pass could begin: '.SDL_GetError());
+                                SDL_BindGPUGraphicsPipeline($gp, $this->glassPipeline());
+                                $binding = new SDL_GPUTextureSamplerBinding();
+                                $binding->texture = $input;
+                                $binding->sampler = $this->sampler();
+                                SDL_BindGPUFragmentSamplers($gp, 0, [$binding], 1);
+                                $uniform = pack('g8', (float) $kind, 0.0, 0.0, 0.0, $a, $b, 0.0, 0.0);
+                                SDL_PushGPUFragmentUniformData($commands, 0, $uniform, strlen($uniform));
+                                SDL_DrawGPUPrimitives($gp, 3, 1, 0, 0);
+                                SDL_EndGPURenderPass($gp);
+                            }
+                            $pass = $begin($current, SDL_GPU_LOADOP_LOAD);
+                            SDL_SetGPUScissor($pass, $scissor);
+                            break;
+
+                        case Op::GLASS:
+                            [, $first, $geometry, $look, $depth] = $operation;
+                            if ($panes === null) {
+                                break;
+                            }
+                            [$frost, $refraction, $bevel, $saturation, $glow, $grain, $tint, $rimColour, $alpha] = $look;
+                            SDL_BindGPUGraphicsPipeline($pass, $this->pipeline('fill'));
+                            $this->bindTexture($pass, $panes['samples'][$depth], $panes['sharp']);
+                            $this->uniforms($commands, self::paintBytes(self::GLASS, $tint, opacity: $alpha, linear: $frost < 1.0 ? 1 : 0,
+                                shape: [(float) $geometry[0], (float) $geometry[1], (float) $geometry[2], (float) $geometry[3]],
+                                band: [(float) $frost, (float) $refraction, (float) $bevel, (float) $saturation],
+                                abcd: [(float) $glow, (float) $grain, (float) $panes['x'], (float) $panes['y']],
+                                radii: array_map(floatval(...), $geometry[4]),
+                                win: [(float) (($rimColour >> 24) & 0xFF), (float) (($rimColour >> 16) & 0xFF), (float) (($rimColour >> 8) & 0xFF), (float) ($rimColour & 0xFF)]));
+                            SDL_DrawGPUPrimitives($pass, 6, 1, $first, 0);
+                            $this->bindTexture($pass, $this->blank());
+                            break;
+
                         case Op::CLEAR:
                             SDL_SetGPUScissor($pass, self::rect(0, 0, $width, $height));
                             $this->paint($pass, $commands, 'solid', self::SOLID, $operation[1]);
@@ -490,6 +709,17 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
                             $this->paint($pass, $commands, 'cover', self::FILL, $operation[2]);
                             SDL_SetGPUStencilReference($pass, 0);
                             SDL_DrawGPUPrimitives($pass, 6, 1, $operation[1], 0);
+                            break;
+
+                        case Op::COVER_GRADIENT:
+                            // As COVER, in the gradient: the ramp is the bound source, the shader reads its entry for each pixel.
+                            [, $first, $texture, $kind, $inverse, $spread] = $operation;
+                            SDL_BindGPUGraphicsPipeline($pass, $this->pipeline('cover'));
+                            $this->bindTexture($pass, $textures[$texture]);
+                            $this->uniforms($commands, self::paintBytes(self::GRADIENT, 0, band: [(float) $kind, (float) $spread, 0.0, 0.0],
+                                abcd: [$inverse->a, $inverse->b, $inverse->c, $inverse->d], efwh: [$inverse->e, $inverse->f, 0.0, 0.0]));
+                            SDL_SetGPUStencilReference($pass, 0);
+                            SDL_DrawGPUPrimitives($pass, 6, 1, $first, 0);
                             break;
 
                         case Op::RECTS:
@@ -525,10 +755,10 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
                             $texelBinding = new SDL_GPUBufferBinding();
                             $texelBinding->buffer = $buffer;
                             $texelBinding->offset = ($texels - $first) * 8;
-                            SDL_BindGPUVertexBuffers($pass, 1, [$texelBinding]);
+                            SDL_BindGPUVertexBuffers($pass, 1, [$texelBinding], 1);
                             SDL_DrawGPUPrimitives($pass, $count, 1, $first, 0);
                             $texelBinding->offset = 0;
-                            SDL_BindGPUVertexBuffers($pass, 1, [$texelBinding]);
+                            SDL_BindGPUVertexBuffers($pass, 1, [$texelBinding], 1);
                             $this->bindTexture($pass, $this->blank());
                             break;
 
@@ -551,12 +781,16 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
                             break;
 
                         case Op::IMAGE:
-                            [, $first, $texture, $inverse, $opacity, $filter] = $operation;
+                            [, $first, $texture, $inverse, $opacity, $filter, $tint, $window, $round] = $operation;
                             SDL_BindGPUGraphicsPipeline($pass, $this->pipeline('fill'));
                             $this->bindTexture($pass, $textures[$texture]);
                             [$w, $h] = $this->sizes[spl_object_id($textures[$texture])];
-                            $this->uniforms($commands, self::paintBytes(self::IMAGE, 0, opacity: $opacity, linear: $filter === Filter::LINEAR ? 1 : 0,
-                                abcd: [$inverse->a, $inverse->b, $inverse->c, $inverse->d], efwh: [$inverse->e, $inverse->f, (float) $w, (float) $h], flags: isset($this->floatTextures[spl_object_id($textures[$texture])]) ? 2 : 0));
+                            $this->uniforms($commands, self::paintBytes(self::IMAGE, $tint, opacity: $opacity, linear: $filter === Filter::LINEAR ? 1 : 0,
+                                shape: $round === null ? [0.0, 0.0, 0.0, 0.0] : [(float) $round[0], (float) $round[1], (float) $round[2], (float) $round[3]],
+                                band: [$round === null ? 0.0 : 1.0, $window === null ? 0.0 : 1.0, (float) $this->samples, 0.0],
+                                abcd: [$inverse->a, $inverse->b, $inverse->c, $inverse->d], efwh: [$inverse->e, $inverse->f, (float) $w, (float) $h], flags: isset($this->floatTextures[spl_object_id($textures[$texture])]) ? 2 : 0,
+                                radii: $round === null ? [0.0, 0.0, 0.0, 0.0] : array_map(floatval(...), $round[4]),
+                                win: array_map(floatval(...), $window ?? [0.0, 0.0, 0.0, 0.0])));
                             SDL_DrawGPUPrimitives($pass, 6, 1, $first, 0);
                             break;
                     }
@@ -565,18 +799,146 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
                 SDL_EndGPURenderPass($pass);
             });
         } finally {
+            $taken = array_flip(array_map(spl_object_id(...), $this->uploaded));
             foreach ($textures as $texture) {
+                if (isset($layerTextures[spl_object_id($texture)]) || isset($taken[spl_object_id($texture)])) {
+                    continue;
+                }
                 unset($this->sizes[spl_object_id($texture)]);
                 unset($this->floatTextures[spl_object_id($texture)]);
                 SDL_ReleaseGPUTexture($this->gpu, $texture);
             }
-            SDL_ReleaseGPUBuffer($this->gpu, $buffer);
+            foreach ($scratch as $texture) {
+                SDL_ReleaseGPUTexture($this->gpu, $texture);
+            }
+            $this->keepUploads();
         }
+    }
+
+    /**
+     * A pyramid for $region of the target texture under a list's panes: levels (the capture, down to the deepest depth, and
+     * up to half size for each depth) from the pool, and the passes that make them.
+     *
+     * @param  list<int>  $depths
+     * @return array<string, mixed>
+     */
+    private function glassBuild(SDL_GPUTexture $target, Region $region, array $depths): array
+    {
+        $levels = [];
+        $passes = [];
+        $capture = $levels[] = $this->glassLevel($region->width, $region->height);
+        $passes[] = [0, $target, $capture[0], (float) $region->x, (float) $region->y];
+        $down = [$capture];
+        for ($k = 1, $deepest = max($depths); $k <= $deepest; $k++) {
+            [, $w, $h] = $down[$k - 1];
+            $down[$k] = $levels[] = $this->glassLevel(intdiv($w + 1, 2), intdiv($h + 1, 2));
+            $passes[] = [1, $down[$k - 1][0], $down[$k][0], (float) $w, (float) $h];
+        }
+        $samples = [];
+        foreach ($depths as $depth) {
+            $up = $down[$depth];
+            for ($k = $depth - 1; $k >= 1; $k--) {
+                $out = $levels[] = $this->glassLevel($down[$k][1], $down[$k][2]);
+                $passes[] = [2, $up[0], $out[0], (float) $up[1], (float) $up[2]];
+                $up = $out;
+            }
+            $samples[$depth] = $up[0];
+        }
+
+        return ['levels' => $levels, 'passes' => $passes, 'samples' => $samples, 'sharp' => $capture[0], 'x' => $region->x, 'y' => $region->y];
+    }
+
+    /** A pyramid let go: its levels back to the pool. */
+    private function glassDiscard(array $pyramid): void
+    {
+        foreach ($pyramid['levels'] as $level) {
+            $this->glassRelease($level);
+        }
+    }
+
+    /** @return array{SDL_GPUTexture, int, int} A level of this size: a free texture from the pool, or a new one. */
+    private function glassLevel(int $width, int $height): array
+    {
+        $key = "{$width}x{$height}";
+        if (! empty($this->glassPool[$key])) {
+            $this->glassBytes -= $width * $height * 4;
+
+            return [array_pop($this->glassPool[$key]), $width, $height];
+        }
+
+        return [$this->texture($this->colorFormat, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER), $width, $height];
+    }
+
+    /** @param array{SDL_GPUTexture, int, int} $level A level nothing keeps, for the next pyramid; over GLASS_POOL_BYTES the sizes used longest ago are released first. */
+    private function glassRelease(array $level): void
+    {
+        [$texture, $width, $height] = $level;
+        $key = "{$width}x{$height}";
+        $list = $this->glassPool[$key] ?? [];
+        $list[] = $texture;
+        unset($this->glassPool[$key]);
+        $this->glassPool[$key] = $list;
+        $this->glassBytes += $width * $height * 4;
+        while ($this->glassBytes > self::GLASS_POOL_BYTES && $this->glassPool !== []) {
+            $oldest = array_key_first($this->glassPool);
+            if ($this->glassPool[$oldest] === []) { // a size taken empty elsewhere holds nothing to free
+                unset($this->glassPool[$oldest]);
+
+                continue;
+            }
+            [$w, $h] = array_map('intval', explode('x', $oldest));
+            SDL_ReleaseGPUTexture($this->gpu, array_shift($this->glassPool[$oldest]));
+            $this->glassBytes -= $w * $h * 4;
+            if ($this->glassPool[$oldest] === []) {
+                unset($this->glassPool[$oldest]);
+            }
+        }
+    }
+
+    /** The glass pass pipeline: the filter's vertex stage, the glass fragment stage (one sampler, one uniform block), one colour target. */
+    private function glassPipeline(): SDL_GPUGraphicsPipeline
+    {
+        if (! is_null($this->glassPipeline)) {
+            return $this->glassPipeline;
+        }
+        $this->filterPipeline();
+        $shader = new SDL_GPUShaderCreateInfo();
+        $shader->stage = SDL_GPU_SHADERSTAGE_FRAGMENT;
+        if (SDL_GetGPUShaderFormats($this->gpu) & SDL_GPU_SHADERFORMAT_SPIRV) {
+            $shader->format = SDL_GPU_SHADERFORMAT_SPIRV;
+            $shader->code = file_get_contents(self::SHADERS.'/glass.frag.spv');
+            $shader->entrypoint = 'main';
+        } else {
+            $shader->format = SDL_GPU_SHADERFORMAT_MSL;
+            $shader->code = file_get_contents(self::SHADERS.'/filter.metal');
+            $shader->entrypoint = 'glass_paint';
+        }
+        $shader->num_uniform_buffers = 1;
+        $shader->num_samplers = 1;
+        $this->glassShader = SDL_CreateGPUShader($this->gpu, $shader)
+            ?? throw new DrawingException('sdl3: the glass fragment shader was refused: '.SDL_GetError());
+        $info = new SDL_GPUGraphicsPipelineCreateInfo();
+        $info->vertex_shader = $this->filterShaders[SDL_GPU_SHADERSTAGE_VERTEX];
+        $info->fragment_shader = $this->glassShader;
+        $info->primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        $info->rasterizer_state->fill_mode = SDL_GPU_FILLMODE_FILL;
+        $info->rasterizer_state->cull_mode = SDL_GPU_CULLMODE_NONE;
+        $info->rasterizer_state->front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+        $info->multisample_state->sample_count = SDL_GPU_SAMPLECOUNT_1;
+        $color = new SDL_GPUColorTargetDescription();
+        $color->format = $this->colorFormat;
+        $color->blend_state->enable_color_write_mask = true;
+        $color->blend_state->color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A;
+        $info->target_info->color_target_descriptions = [$color];
+        $info->target_info->has_depth_stencil_target = false;
+
+        return $this->glassPipeline = SDL_CreateGPUGraphicsPipeline($this->gpu, $info)
+            ?? throw new DrawingException("sdl3: the glass pipeline was refused by {$this->driver()}: ".SDL_GetError());
     }
 
     public function adopt(LentSurface $surface): void
     {
-        $window = SDL_Window::fromPointer($surface->handle('window'));
+        $window = SDL_Window::fromPointer($surface->handle('window')) ?? throw new DrawingException('sdl3: the surface lent no window.');
         if (! SDL_ClaimWindowForGPUDevice($this->gpu, $window)) {
             throw new DrawingException('sdl3: the window could not be claimed for the device: '.SDL_GetError());
         }
@@ -785,7 +1147,7 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         $color->texture = $swapchain;
         $color->load_op = SDL_GPU_LOADOP_DONT_CARE;
         $color->store_op = SDL_GPU_STOREOP_STORE;
-        $pass = SDL_BeginGPURenderPass($commands, [$color], null)
+        $pass = SDL_BeginGPURenderPass($commands, [$color], 1, null)
             ?? throw new DrawingException('sdl3: the show pass could not begin: '.SDL_GetError());
         SDL_BindGPUGraphicsPipeline($pass, $this->showPipeline(SDL_GetGPUSwapchainTextureFormat($this->gpu, $window)));
         $this->bindTexture($pass, $this->resolved);
@@ -834,6 +1196,43 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
             SDL_ReleaseGPUShader($this->gpu, $shader);
         }
         $this->shaders = [];
+        foreach ($this->glassKept as $kept) {
+            foreach ($kept['levels'] as [$texture]) {
+                SDL_ReleaseGPUTexture($this->gpu, $texture);
+            }
+        }
+        $this->glassKept = [];
+        foreach ($this->glassPool as $textures) {
+            foreach ($textures as $texture) {
+                SDL_ReleaseGPUTexture($this->gpu, $texture);
+            }
+        }
+        $this->glassPool = [];
+        foreach ($this->sourcePool as $textures) {
+            array_map($this->releaseSource(...), $textures);
+        }
+        $this->sourcePool = [];
+        foreach ($this->stagings as $staging) {
+            SDL_ReleaseGPUTransferBuffer($this->gpu, $staging);
+        }
+        $this->stagings = [];
+        is_null($this->vertexGpu) || SDL_ReleaseGPUBuffer($this->gpu, $this->vertexGpu);
+        is_null($this->vertexTransfer) || SDL_ReleaseGPUTransferBuffer($this->gpu, $this->vertexTransfer);
+        $this->vertexGpu = $this->vertexTransfer = null;
+        $this->vertexGpuSize = $this->vertexTransferSize = 0;
+        if (! is_null($this->glassPipeline)) {
+            SDL_ReleaseGPUGraphicsPipeline($this->gpu, $this->glassPipeline);
+            SDL_ReleaseGPUShader($this->gpu, $this->glassShader);
+            $this->glassPipeline = $this->glassShader = null;
+        }
+        if (! is_null($this->filterPipeline)) {
+            SDL_ReleaseGPUGraphicsPipeline($this->gpu, $this->filterPipeline);
+            $this->filterPipeline = null;
+        }
+        foreach ($this->filterShaders as $shader) {
+            SDL_ReleaseGPUShader($this->gpu, $shader);
+        }
+        $this->filterShaders = [];
         if (! is_null($this->window)) {
             SDL_ReleaseWindowFromGPUDevice($this->gpu, $this->window);
             $this->window = null;
@@ -861,7 +1260,7 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         $binding = new SDL_GPUBufferBinding();
         $binding->buffer = $buffer;
         // Slot 1 carries GLYPHS' texels; every other draw leaves it at offset 0 and reads nothing from it.
-        SDL_BindGPUVertexBuffers($pass, 0, [$binding, $binding]);
+        SDL_BindGPUVertexBuffers($pass, 0, [$binding, $binding], 2);
         $frame = pack('g4', (float) $width, (float) $height, 0.0, 0.0);
         SDL_PushGPUVertexUniformData($commands, 0, $frame, strlen($frame));
         // The fragment program declares a sampler: every draw needs one bound, read or not.
@@ -881,7 +1280,7 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         $color->texture = $this->multisampled;
         $color->load_op = SDL_GPU_LOADOP_DONT_CARE;
         $color->store_op = SDL_GPU_STOREOP_STORE;
-        $pass = SDL_BeginGPURenderPass($commands, [$color], $this->stencilTarget())
+        $pass = SDL_BeginGPURenderPass($commands, [$color], 1, $this->stencilTarget())
             ?? throw new DrawingException('sdl3: no render pass could begin: '.SDL_GetError());
         $this->prepare($pass, $commands, $buffer, $width, $height);
         SDL_BindGPUGraphicsPipeline($pass, $this->pipeline('solid'));
@@ -907,12 +1306,16 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         SDL_PushGPUFragmentUniformData($commands, 0, $bytes, strlen($bytes));
     }
 
-    private function bindTexture(SDL_GPURenderPass $pass, SDL_GPUTexture $texture): void
+    private function bindTexture(SDL_GPURenderPass $pass, SDL_GPUTexture $texture, ?SDL_GPUTexture $sharp = null): void
     {
-        $binding = new SDL_GPUTextureSamplerBinding();
-        $binding->texture = $texture;
-        $binding->sampler = $this->sampler();
-        SDL_BindGPUFragmentSamplers($pass, 0, [$binding]);
+        $bindings = [];
+        foreach ([$texture, $sharp ?? $this->blank()] as $each) {
+            $binding = new SDL_GPUTextureSamplerBinding();
+            $binding->texture = $each;
+            $binding->sampler = $this->sampler();
+            $bindings[] = $binding;
+        }
+        SDL_BindGPUFragmentSamplers($pass, 0, $bindings, 2);
     }
 
     /** A nearest, clamp-to-edge sampler: the shader fetches texels itself and never filters. */
@@ -932,35 +1335,69 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         return $this->sampler = SDL_CreateGPUSampler($this->gpu, $info) ?? throw new DrawingException('sdl3: no sampler could be made: '.SDL_GetError());
     }
 
+    /** The smallest a vertex buffer or a staging buffer is made: 256 KiB holds about 32,000 vertices. */
+    private const int RING_MIN = 262144;
+
+    /** Source textures kept for each size, and the sizes kept. */
+    private const int POOL_PER_SIZE = 8;
+
+    private const int POOL_SIZES = 24;
+
+    /** The vertex buffer kept across frames (G3), and the transfer buffer that fills it: both written with cycle on, so SDL keeps the contents a frame in flight reads. */
+    private ?SDL_GPUBuffer $vertexGpu = null;
+
+    private int $vertexGpuSize = 0;
+
+    private ?SDL_GPUTransferBuffer $vertexTransfer = null;
+
+    private int $vertexTransferSize = 0;
+
+    /** @var array<int, SDL_GPUTransferBuffer> Staging buffers for sources, by size class (powers of two, 4 KiB at least). */
+    private array $stagings = [];
+
+    /** @var array<string, list<SDL_GPUTexture>> Free source textures by "format x w x h", the size used last at the end. */
+    private array $sourcePool = [];
+
+    /** @var list<SDL_GPUTexture> The source textures this frame made or took; they go back to the pool when it ends. */
+    private array $uploaded = [];
+
+    /** A vertex buffer of at least this many bytes: the kept one, or a larger one (the old goes when no frame reads it). */
     private function vertexBuffer(string $vertices): SDL_GPUBuffer
     {
-        $info = new SDL_GPUBufferCreateInfo();
-        $info->usage = SDL_GPU_BUFFERUSAGE_VERTEX;
-        $info->size = strlen($vertices);
+        $length = strlen($vertices);
+        if (is_null($this->vertexGpu) || $this->vertexGpuSize < $length) {
+            $info = new SDL_GPUBufferCreateInfo();
+            $info->usage = SDL_GPU_BUFFERUSAGE_VERTEX;
+            $info->size = max(self::RING_MIN, 1 << (int) ceil(log($length, 2)));
+            $made = SDL_CreateGPUBuffer($this->gpu, $info) ?? throw new DrawingException('sdl3: no vertex buffer could be made: '.SDL_GetError());
+            is_null($this->vertexGpu) || SDL_ReleaseGPUBuffer($this->gpu, $this->vertexGpu);
+            [$this->vertexGpu, $this->vertexGpuSize] = [$made, $info->size];
+        }
 
-        return SDL_CreateGPUBuffer($this->gpu, $info) ?? throw new DrawingException('sdl3: no vertex buffer could be made: '.SDL_GetError());
+        return $this->vertexGpu;
     }
 
     /** The frame's vertices into the buffer, in a copy pass at the front of the command buffer. */
     private function uploadVertices(SDL_GPUCommandBuffer $commands, SDL_GPUBuffer $buffer, string $vertices): void
     {
-        $upload = $this->transferBuffer(strlen($vertices), SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
-        try {
-            $this->fillTransfer($upload, $vertices);
-            $copy = SDL_BeginGPUCopyPass($commands) ?? throw new DrawingException('sdl3: no copy pass could begin: '.SDL_GetError());
-            $source = new SDL_GPUTransferBufferLocation();
-            $source->transfer_buffer = $upload;
-            $destination = new SDL_GPUBufferRegion();
-            $destination->buffer = $buffer;
-            $destination->size = strlen($vertices);
-            SDL_UploadToGPUBuffer($copy, $source, $destination, false);
-            SDL_EndGPUCopyPass($copy);
-        } finally {
-            SDL_ReleaseGPUTransferBuffer($this->gpu, $upload);
+        $length = strlen($vertices);
+        if (is_null($this->vertexTransfer) || $this->vertexTransferSize < $length) {
+            $size = max(self::RING_MIN, 1 << (int) ceil(log($length, 2)));
+            $made = $this->transferBuffer($size, SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
+            is_null($this->vertexTransfer) || SDL_ReleaseGPUTransferBuffer($this->gpu, $this->vertexTransfer);
+            [$this->vertexTransfer, $this->vertexTransferSize] = [$made, $size];
         }
+        $this->fillTransfer($this->vertexTransfer, $vertices, cycle: true);
+        $copy = SDL_BeginGPUCopyPass($commands) ?? throw new DrawingException('sdl3: no copy pass could begin: '.SDL_GetError());
+        $source = new SDL_GPUTransferBufferLocation();
+        $source->transfer_buffer = $this->vertexTransfer;
+        $destination = new SDL_GPUBufferRegion();
+        $destination->buffer = $buffer;
+        $destination->size = $length;
+        SDL_UploadToGPUBuffer($copy, $source, $destination, true);
+        SDL_EndGPUCopyPass($copy);
     }
 
-    /** $bytes (tightly packed, rows top-down) into $region of $texture, in a copy pass of this command buffer. */
     private function uploadRegion(SDL_GPUCommandBuffer $commands, SDL_GPUTexture $texture, Region $region, string $bytes): void
     {
         $staging = $this->transferBuffer(strlen($bytes), SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
@@ -984,36 +1421,53 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
         $width = $source->viewportWidth();
         $height = $source->viewportHeight();
         $float = $source instanceof HdrImage && $this->space->isHdr();
-        $texture = $this->texture($float ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        $format = $float ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        $key = "{$format}x{$width}x{$height}";
+        $texture = ! empty($this->sourcePool[$key]) ? array_pop($this->sourcePool[$key]) : $this->texture($format, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_SAMPLER);
         $this->sizes[spl_object_id($texture)] = [$width, $height];
-        if ($float) {
-            $this->floatTextures[spl_object_id($texture)] = true;
-        }
-        $staging = null;
-        try {
-            $texels = $float ? $source->rgba16f() : $source->toRgba8();
-            $staging = $this->transferBuffer(strlen($texels), SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
-            $this->fillTransfer($staging, $texels);
-            $copy = SDL_BeginGPUCopyPass($commands) ?? throw new DrawingException('sdl3: no copy pass could begin: '.SDL_GetError());
-            $from = new SDL_GPUTextureTransferInfo();
-            $from->transfer_buffer = $staging;
-            $from->pixels_per_row = $width;
-            $from->rows_per_layer = $height;
-            SDL_UploadToGPUTexture($copy, $from, self::region($texture, Region::wholeSurface($width, $height)), false);
-            SDL_EndGPUCopyPass($copy);
-        } catch (Throwable $failure) {
-            unset($this->sizes[spl_object_id($texture)]);
-            unset($this->floatTextures[spl_object_id($texture)]);
-            SDL_ReleaseGPUTexture($this->gpu, $texture);
-
-            throw $failure;
-        } finally {
-            if (! is_null($staging)) {
-                SDL_ReleaseGPUTransferBuffer($this->gpu, $staging);
-            }
-        }
+        $float && $this->floatTextures[spl_object_id($texture)] = true;
+        $this->uploaded[] = $texture;
+        $texels = $float ? $source->rgba16f() : $source->toRgba8();
+        $class = max(4096, 1 << (int) ceil(log(max(1, strlen($texels)), 2)));
+        $staging = $this->stagings[$class] ??= $this->transferBuffer($class, SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD);
+        $this->fillTransfer($staging, $texels, cycle: true);
+        $copy = SDL_BeginGPUCopyPass($commands) ?? throw new DrawingException('sdl3: no copy pass could begin: '.SDL_GetError());
+        $from = new SDL_GPUTextureTransferInfo();
+        $from->transfer_buffer = $staging;
+        $from->pixels_per_row = $width;
+        $from->rows_per_layer = $height;
+        SDL_UploadToGPUTexture($copy, $from, self::region($texture, Region::wholeSurface($width, $height)), true);
+        SDL_EndGPUCopyPass($copy);
 
         return $texture;
+    }
+
+    /** The frame is over: the source textures it took are free for the next, the sizes used longest ago let go first. */
+    private function keepUploads(): void
+    {
+        foreach ($this->uploaded as $texture) {
+            [$width, $height] = $this->sizes[spl_object_id($texture)];
+            $key = (isset($this->floatTextures[spl_object_id($texture)]) ? SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT : SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM)."x{$width}x{$height}";
+            $list = $this->sourcePool[$key] ?? [];
+            $list[] = $texture;
+            unset($this->sourcePool[$key]);
+            $this->sourcePool[$key] = $list;
+            while (count($this->sourcePool[$key]) > self::POOL_PER_SIZE) {
+                $this->releaseSource(array_shift($this->sourcePool[$key]));
+            }
+        }
+        $this->uploaded = [];
+        while (count($this->sourcePool) > self::POOL_SIZES) {
+            $oldest = array_key_first($this->sourcePool);
+            array_map($this->releaseSource(...), $this->sourcePool[$oldest]);
+            unset($this->sourcePool[$oldest]);
+        }
+    }
+
+    private function releaseSource(SDL_GPUTexture $texture): void
+    {
+        unset($this->sizes[spl_object_id($texture)], $this->floatTextures[spl_object_id($texture)]);
+        SDL_ReleaseGPUTexture($this->gpu, $texture);
     }
 
     /**
@@ -1101,20 +1555,21 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
     }
 
     /**
-     * The Paint block, 112 bytes: mode_rgba[0] = mode, opacity, linear, flags;
-     * mode_rgba[1] = r, g, b, a; shape; band; abcd; efwh; radii.
+     * The Paint block, 128 bytes: mode_rgba[0] = mode, opacity, linear, flags;
+     * mode_rgba[1] = r, g, b, a; shape; band; abcd; efwh; radii; win.
      *
      * @param  array{float, float, float, float}  $shape
      * @param  array{float, float, float, float}  $band
      * @param  array{float, float, float, float}  $abcd
      * @param  array{float, float, float, float}  $efwh
      * @param  array{float, float, float, float}  $radii
+     * @param  array{float, float, float, float}  $win
      */
-    private static function paintBytes(int $mode, int $rgba, int $opacity = 255, int $linear = 0, array $shape = [0.0, 0.0, 0.0, 0.0], array $band = [0.0, 0.0, 0.0, 0.0], array $abcd = [0.0, 0.0, 0.0, 0.0], array $efwh = [0.0, 0.0, 0.0, 0.0], int $flags = 0, array $radii = [0.0, 0.0, 0.0, 0.0]): string
+    private static function paintBytes(int $mode, int $rgba, int $opacity = 255, int $linear = 0, array $shape = [0.0, 0.0, 0.0, 0.0], array $band = [0.0, 0.0, 0.0, 0.0], array $abcd = [0.0, 0.0, 0.0, 0.0], array $efwh = [0.0, 0.0, 0.0, 0.0], int $flags = 0, array $radii = [0.0, 0.0, 0.0, 0.0], array $win = [0.0, 0.0, 0.0, 0.0]): string
     {
         return pack('V4', $mode, $opacity, $linear, $flags)
             .pack('V4', ($rgba >> 24) & 0xFF, ($rgba >> 16) & 0xFF, ($rgba >> 8) & 0xFF, $rgba & 0xFF)
-            .pack('g4', ...$shape).pack('g4', ...$band).pack('g4', ...$abcd).pack('g4', ...$efwh).pack('g4', ...$radii);
+            .pack('g4', ...$shape).pack('g4', ...$band).pack('g4', ...$abcd).pack('g4', ...$efwh).pack('g4', ...$radii).pack('g4', ...$win);
     }
 
     /** Six vertices: x0,y0 x1,y0 x1,y1 x0,y0 x1,y1 x0,y1, as Lowering lays a quad. */
@@ -1159,9 +1614,9 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
     }
 
     /** $bytes into a mapped transfer buffer. */
-    private function fillTransfer(SDL_GPUTransferBuffer $buffer, string $bytes): void
+    private function fillTransfer(SDL_GPUTransferBuffer $buffer, string $bytes, bool $cycle = false): void
     {
-        $address = SDL_MapGPUTransferBuffer($this->gpu, $buffer, false);
+        $address = SDL_MapGPUTransferBuffer($this->gpu, $buffer, $cycle);
         if ($address === 0) {
             throw new DrawingException('sdl3: a transfer buffer could not be mapped: '.SDL_GetError());
         }
@@ -1175,28 +1630,114 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
     }
 
     /** The colour target of a pass over the target: loaded or cleared to transparent black, stored, resolved with four samples. */
-    private function colorTarget(int $load): SDL_GPUColorTargetInfo
+    private function colorTarget(int $load, int $slot = 0): SDL_GPUColorTargetInfo
     {
         $color = new SDL_GPUColorTargetInfo();
         $color->load_op = $load;
         [$color->clear_color->r, $color->clear_color->g, $color->clear_color->b, $color->clear_color->a] = [0.0, 0.0, 0.0, 0.0];
-        if (is_null($this->multisampled)) {
-            $color->texture = $this->resolved;
+        $multisampled = $slot === 0 ? $this->multisampled : $this->slots[$slot]['multisampled'];
+        $resolved = $this->slotTexture($slot);
+        if (is_null($multisampled)) {
+            $color->texture = $resolved;
             $color->store_op = SDL_GPU_STOREOP_STORE;
         } else {
-            $color->texture = $this->multisampled;
-            $color->resolve_texture = $this->resolved;
+            $color->texture = $multisampled;
+            $color->resolve_texture = $resolved;
             $color->store_op = SDL_GPU_STOREOP_RESOLVE_AND_STORE;
         }
 
         return $color;
     }
 
+    /** The resolved texture of a target: the frame's own for 0, a layer target's otherwise. */
+    private function slotTexture(int $slot): SDL_GPUTexture
+    {
+        return $slot === 0 ? $this->resolved : $this->slots[$slot]['resolved'];
+    }
+
+    /**
+     * A layer target, made on first use: the frame's own kind of texture (colour at its samples, resolved, a stencil).
+     *
+     * @throws DrawingException On a target in an HDR colour space.
+     */
+    private function ensureSlot(int $slot): void
+    {
+        if ($slot === 0 || isset($this->slots[$slot])) {
+            return;
+        }
+        if ($this->space->isHdr()) {
+            throw new DrawingException('sdl3: layers are not drawn on a target in an HDR colour space yet.');
+        }
+        $width = $this->framebuffer->width();
+        $height = $this->framebuffer->height();
+        $resolved = $this->texture($this->colorFormat, $width, $height, SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+        $this->sizes[spl_object_id($resolved)] = [$width, $height];
+        $this->slots[$slot] = [
+            'resolved' => $resolved,
+            'multisampled' => $this->samples === 4 ? $this->texture($this->colorFormat, $width, $height, SDL_GPU_SAMPLECOUNT_4, SDL_GPU_TEXTUREUSAGE_COLOR_TARGET) : null,
+            'stencil' => $this->texture($this->stencil_format, $width, $height, $this->samples === 4 ? SDL_GPU_SAMPLECOUNT_4 : SDL_GPU_SAMPLECOUNT_1, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET),
+        ];
+    }
+
+    /** $from's $source region copied into $into's $destination region, no blending, outside a pass. */
+    private function blit(SDL_GPUCommandBuffer $commands, SDL_GPUTexture $from, SDL_GPUTexture $into, Region $source, Region $destination): void
+    {
+        $info = new SDL_GPUBlitInfo();
+        [$info->source->texture, $info->source->x, $info->source->y, $info->source->w, $info->source->h] = [$from, $source->x, $source->y, $source->width, $source->height];
+        [$info->destination->texture, $info->destination->x, $info->destination->y, $info->destination->w, $info->destination->h] = [$into, $destination->x, $destination->y, $destination->width, $destination->height];
+        $info->load_op = SDL_GPU_LOADOP_LOAD;
+        $info->filter = SDL_GPU_FILTER_NEAREST;
+        SDL_BlitGPUTexture($commands, $info);
+    }
+
+    /** The filter program: a triangle and the filter fragment shader, one RGBA8 colour target and nothing else. */
+    private function filterPipeline(): SDL_GPUGraphicsPipeline
+    {
+        if (! is_null($this->filterPipeline)) {
+            return $this->filterPipeline;
+        }
+        foreach ([SDL_GPU_SHADERSTAGE_VERTEX, SDL_GPU_SHADERSTAGE_FRAGMENT] as $stage) {
+            $fragment = $stage === SDL_GPU_SHADERSTAGE_FRAGMENT;
+            $shader = new SDL_GPUShaderCreateInfo();
+            $shader->stage = $stage;
+            if (SDL_GetGPUShaderFormats($this->gpu) & SDL_GPU_SHADERFORMAT_SPIRV) {
+                $shader->format = SDL_GPU_SHADERFORMAT_SPIRV;
+                $shader->code = file_get_contents(self::SHADERS.'/filter.'.($fragment ? 'frag' : 'vert').'.spv');
+                $shader->entrypoint = 'main';
+            } else {
+                $shader->format = SDL_GPU_SHADERFORMAT_MSL;
+                $shader->code = file_get_contents(self::SHADERS.'/filter.metal');
+                $shader->entrypoint = $fragment ? 'filter_paint' : 'filter_place';
+            }
+            $shader->num_uniform_buffers = $fragment ? 1 : 0;
+            $shader->num_samplers = $fragment ? 4 : 0;
+            $this->filterShaders[$stage] = SDL_CreateGPUShader($this->gpu, $shader)
+                ?? throw new DrawingException('sdl3: the filter '.($fragment ? 'fragment' : 'vertex').' shader was refused: '.SDL_GetError());
+        }
+        $info = new SDL_GPUGraphicsPipelineCreateInfo();
+        $info->vertex_shader = $this->filterShaders[SDL_GPU_SHADERSTAGE_VERTEX];
+        $info->fragment_shader = $this->filterShaders[SDL_GPU_SHADERSTAGE_FRAGMENT];
+        $info->primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        $info->rasterizer_state->fill_mode = SDL_GPU_FILLMODE_FILL;
+        $info->rasterizer_state->cull_mode = SDL_GPU_CULLMODE_NONE;
+        $info->rasterizer_state->front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+        $info->multisample_state->sample_count = SDL_GPU_SAMPLECOUNT_1;
+        $color = new SDL_GPUColorTargetDescription();
+        $color->format = $this->colorFormat;
+        $color->blend_state->enable_color_write_mask = true;
+        $color->blend_state->color_write_mask = SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G | SDL_GPU_COLORCOMPONENT_B | SDL_GPU_COLORCOMPONENT_A;
+        $info->target_info->color_target_descriptions = [$color];
+        $info->target_info->has_depth_stencil_target = false;
+
+        return $this->filterPipeline = SDL_CreateGPUGraphicsPipeline($this->gpu, $info)
+            ?? throw new DrawingException("sdl3: the filter pipeline was refused by {$this->driver()}: ".SDL_GetError());
+    }
+
     /** The stencil, cleared and dropped every pass. */
-    private function stencilTarget(): SDL_GPUDepthStencilTargetInfo
+    private function stencilTarget(int $slot = 0): SDL_GPUDepthStencilTargetInfo
     {
         $stencil = new SDL_GPUDepthStencilTargetInfo();
-        $stencil->texture = $this->stencil;
+        $stencil->texture = $slot === 0 ? $this->stencil : $this->slots[$slot]['stencil'];
         $stencil->clear_depth = 1.0;
         $stencil->load_op = SDL_GPU_LOADOP_CLEAR;
         $stencil->store_op = SDL_GPU_STOREOP_DONT_CARE;
@@ -1266,6 +1807,15 @@ final class Sdl3Device implements GpuDevice, SwitchesVsync, QueuesFrames, Target
     /** The multisampled and stencil textures and the pipelines; the resolved texture is its Sdl3Framebuffer's. */
     private function releaseTarget(): void
     {
+        foreach ($this->slots as $slot) {
+            unset($this->sizes[spl_object_id($slot['resolved'])]);
+            foreach ([$slot['resolved'], $slot['multisampled'], $slot['stencil']] as $texture) {
+                if (! is_null($texture)) {
+                    SDL_ReleaseGPUTexture($this->gpu, $texture);
+                }
+            }
+        }
+        $this->slots = [];
         foreach ([$this->multisampled, $this->stencil] as $texture) {
             if (! is_null($texture)) {
                 SDL_ReleaseGPUTexture($this->gpu, $texture);

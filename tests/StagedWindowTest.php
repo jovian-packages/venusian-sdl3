@@ -116,10 +116,11 @@ it('places a small framebuffer by the scaling fit, the bars black', function ():
     $into = $window->presentRect(64, 40);
     $read = function (int $x, int $y) use ($surface): string {
         $io = SDL_IOFromConstMem($surface->pixels() + $y * $surface->pitch() + $x * 4, 4);
-        $bytes = SDL_ReadIO($io, 4);
+        $pixel = new FbBuffer(new FbFormat(FB_LAYOUT_RGBA8888, channelOrder: FB_CHANNELS_RGBA), 1, 1);
+        SDL_ReadIO($io, $pixel->pointer(), 4);
         SDL_CloseIO($io);
 
-        return $bytes;
+        return $pixel->bytes();
     };
     expect($into->width % 64)->toBe(0)
         ->and(trim($read($into->x, $into->y), "\0"))->not->toBe('')

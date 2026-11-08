@@ -28,6 +28,7 @@
     "require": {
         "php": "~8.4.27||^8.5.12",
         "ext-sdl3": "^0.11.0",
+        "ext-fb": "^0.11.1",
         "venusian-surface/bridge": "^0.11.0",
         "venusian-surface/contracts": "^0.11.0",
         "venusian-surface/drawing": "^0.11.0",

@@ -24,6 +24,8 @@ use Surface\Contracts\Drawing\SurfaceKind;
 use Surface\Contracts\Drawing\VSync;
 use Surface\Contracts\Framebuffers\DamageTrackingFramebuffer;
 use Surface\Contracts\Framebuffers\Region;
+use Surface\Contracts\HumanInput\Modifiers;
+use Surface\Contracts\HumanInput\MouseButton;
 use Surface\Contracts\Windows\Display;
 use Surface\Contracts\Windows\DisplayMode;
 use Surface\Contracts\Windows\Hdr;
@@ -64,6 +66,9 @@ class Sdl3StagedWindow extends StagedWindow
     protected readonly string $driver_name;
 
     protected bool $key = false;
+
+    /** The mouse button pressed first and not yet released: motion is a drag while it is held. */
+    protected ?MouseButton $held = null;
 
     /** The mode last reported through modeChanged(). */
     protected WindowMode $native_mode = WindowMode::Windowed;
@@ -224,14 +229,58 @@ class Sdl3StagedWindow extends StagedWindow
         };
     }
 
-    /** One SDL key or text event for this window, routed here by the session. */
+    /**
+     * One SDL mouse, key or text event for this window, routed here by the session. The button
+     * pressed first owns a drag: motion while it is held posts as a drag, else as a move.
+     */
     public function input(SDL_Event $event): void
     {
         match ($event->type) {
+            SDL_EVENT_MOUSE_MOTION => $this->held === null
+                ? $this->pointerMoved($event->motion->x, $event->motion->y, $this->modifiers())
+                : $this->dragged($event->motion->x, $event->motion->y, $this->held, $this->modifiers()),
+            SDL_EVENT_MOUSE_BUTTON_DOWN => $this->buttonDown($event->button),
+            SDL_EVENT_MOUSE_BUTTON_UP => $this->buttonUp($event->button),
+            SDL_EVENT_MOUSE_WHEEL => $this->wheel($event->wheel),
             SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP => $this->keyEvent($event->key),
             SDL_EVENT_TEXT_INPUT => $this->textCommitted($event->text->text),
             default => null,
         };
+    }
+
+    private function buttonDown(\SDL_MouseButtonEvent $event): void
+    {
+        $button = Sdl3InputEngine::mouseButton($event->button);
+        if ($button === null) {
+            return;
+        }
+        $this->held ??= $button;
+        $this->pressed($event->x, $event->y, $button, $event->clicks, $this->modifiers());
+    }
+
+    private function buttonUp(\SDL_MouseButtonEvent $event): void
+    {
+        $button = Sdl3InputEngine::mouseButton($event->button);
+        if ($button === null) {
+            return;
+        }
+        if ($this->held === $button) {
+            $this->held = null;
+        }
+        $this->released($event->x, $event->y, $button, $this->modifiers());
+    }
+
+    /** SDL reports a flipped ("natural") wheel negated: undone, so dy > 0 is always rolled away from the user. SDL has no precise-versus-tick flag, so precise is false. */
+    private function wheel(\SDL_MouseWheelEvent $event): void
+    {
+        $sign = $event->direction === SDL_MOUSEWHEEL_FLIPPED ? -1.0 : 1.0;
+        $this->wheeled($sign * $event->x, $sign * $event->y, false, $this->modifiers());
+    }
+
+    /** The modifier keys held now. */
+    private function modifiers(): Modifiers
+    {
+        return Sdl3InputEngine::modifiers(SDL_GetModState());
     }
 
     /** The key's layout character is SDL's keycode when that is printable text, else ''. */
@@ -506,7 +555,7 @@ class Sdl3StagedWindow extends StagedWindow
                 SDL_BlitSurfaceScaled($frame, $from, $surface, $to, $mode);
                 $this->pushed[] = $to;
             }
-            SDL_UpdateWindowSurfaceRects($window, $this->pushed);
+            SDL_UpdateWindowSurfaceRects($window, $this->pushed, count($this->pushed));
         }
         SDL_DestroySurface($frame);
     }
@@ -779,6 +828,7 @@ class Sdl3StagedWindow extends StagedWindow
     protected function lostFocus(): void
     {
         $this->key = false;
+        $this->held = null;
         $this->focusLost();
     }
 

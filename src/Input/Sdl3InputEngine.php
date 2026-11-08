@@ -187,6 +187,19 @@ final class Sdl3InputEngine implements InputEngineDriver, InputTap
         $this->keyboard->update(ScancodeMap::key($event->code), $event->down)->setModifiers(self::modifiers($event->mod));
     }
 
+    /** An SDL button number (SDL_BUTTON_*) as a mouse button; null for one Surface has no name for. */
+    public static function mouseButton(int $sdl): ?MouseButton
+    {
+        return match ($sdl) {
+            SDL_BUTTON_LEFT => MouseButton::LEFT,
+            SDL_BUTTON_MIDDLE => MouseButton::MIDDLE,
+            SDL_BUTTON_RIGHT => MouseButton::RIGHT,
+            SDL_BUTTON_X1 => MouseButton::X1,
+            SDL_BUTTON_X2 => MouseButton::X2,
+            default => null,
+        };
+    }
+
     /** SDL's SDL_Keymod bits as Surface modifiers. */
     public static function modifiers(int $mod): Modifiers
     {
@@ -206,14 +219,7 @@ final class Sdl3InputEngine implements InputEngineDriver, InputTap
 
     private function button(SeenEvent $event, string $window): void
     {
-        $button = match ($event->code) {
-            SDL_BUTTON_LEFT => MouseButton::LEFT,
-            SDL_BUTTON_MIDDLE => MouseButton::MIDDLE,
-            SDL_BUTTON_RIGHT => MouseButton::RIGHT,
-            SDL_BUTTON_X1 => MouseButton::X1,
-            SDL_BUTTON_X2 => MouseButton::X2,
-            default => null,
-        };
+        $button = self::mouseButton($event->code);
         if (is_null($button)) {
             return;
         }

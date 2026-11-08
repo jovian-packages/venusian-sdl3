@@ -90,10 +90,13 @@ class Sdl3Session extends BridgedToolkitSession
         return $dispatched;
     }
 
-    /** The SDL window id a key or text event is for; 0 for any other event. */
+    /** The SDL window id an input event is for; 0 for any other event. */
     private static function windowOf(SDL_Event $event): int
     {
         return match ($event->type) {
+            SDL_EVENT_MOUSE_MOTION => $event->motion->windowID,
+            SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP => $event->button->windowID,
+            SDL_EVENT_MOUSE_WHEEL => $event->wheel->windowID,
             SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP => $event->key->windowID,
             SDL_EVENT_TEXT_INPUT => $event->text->windowID,
             default => 0,

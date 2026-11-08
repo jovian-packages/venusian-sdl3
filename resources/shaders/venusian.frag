@@ -9,13 +9,15 @@ layout(location = 0) in vec2 at;
 layout(location = 1) in vec2 atlas_at;
 layout(location = 0) out vec4 color;
 layout(set = 2, binding = 0) uniform sampler2D source;
+layout(set = 2, binding = 1) uniform sampler2D sharp;   // GLASS: the full-size capture (the blank image when none is bound)
 layout(set = 3, binding = 0) uniform Paint {
     uvec4 mode_rgba[2];   // [0] = mode, opacity, linear, flags; [1] = r, g, b, a
     vec4 shape;           // cx, cy, rx, ry
-    vec4 band;            // OVAL: stroke, hole, samples; ROUND: inset, ring, samples; SHADE: blur, radius, samples
+    vec4 band;            // OVAL: stroke, hole, samples; ROUND: inset, ring, samples; SHADE: blur, radius, samples; IMAGE: rounded, windowed, samples
     vec4 abcd;            // the inverse placement
     vec4 efwh;            // e, f, source width, source height
     vec4 radii;           // ROUND: [tl, tr, br, bl]; shape is then the box x0, y0, x1, y1
+    vec4 win;             // IMAGE with a window: u0, v0, u1, v1 in source pixels; GLASS: the rim light's colour bytes
 };
 
 const uint SOLID = 0u;
@@ -26,6 +28,8 @@ const uint COPY = 4u;
 const uint ROUND = 5u;
 const uint SHADE = 6u;
 const uint GLYPH = 7u;
+const uint GRADIENT = 8u;
+const uint GLASS = 9u;
 
 // Velvet's alpha for a shape: (α · coverage + 127) / 255, coverage in 0..255.
 float shaped(uint alpha, float coverage)
@@ -93,6 +97,60 @@ vec3 linear_light(vec3 c)
     return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
 }
 
+// ---- GLASS: one pane over its box (ext-fb's fb_paint_glass() step for step) ----
+// shape: the box; radii; band: frost, refraction, bevel, saturation; abcd: light, grain, the backdrop's x, y;
+// win: the rim colour bytes; mode_rgba[0]: GLASS, the alpha, whether the sharp capture is bound, flags; mode_rgba[1]: the tint.
+// The level is half size (a scale of 2).
+
+// The signed distance from p to the rounded box, and its outward normal there.
+float glass_distance(vec2 p, out vec2 n)
+{
+    vec2 c = (shape.xy + shape.zw) * 0.5;
+    vec2 h = (shape.zw - shape.xy) * 0.5;
+    float r = p.x < c.x ? (p.y < c.y ? radii.x : radii.w) : (p.y < c.y ? radii.y : radii.z);
+    vec2 q = abs(p - c) - (h - r);
+    float d;
+    if (q.x > 0.0 && q.y > 0.0) {
+        float len = length(q);
+        d = len - r;
+        n = q / len;
+    } else if (q.x > q.y) {
+        d = q.x - r;
+        n = vec2(1.0, 0.0);
+    } else {
+        d = q.y - r;
+        n = vec2(0.0, 1.0);
+    }
+    n *= vec2(p.x < c.x ? -1.0 : 1.0, p.y < c.y ? -1.0 : 1.0);
+    return d;
+}
+
+vec3 glass_sample(sampler2D level, vec2 uv)
+{
+    ivec2 size = textureSize(level, 0);
+    vec2 f = floor(uv);
+    vec2 t = uv - f;
+    int x0 = clamp(int(f.x), 0, size.x - 1);
+    int x1 = clamp(int(f.x) + 1, 0, size.x - 1);
+    int y0 = clamp(int(f.y), 0, size.y - 1);
+    int y1 = clamp(int(f.y) + 1, 0, size.y - 1);
+    vec3 a = floor(texelFetch(level, ivec2(x0, y0), 0).rgb * 255.0 + 0.5);
+    vec3 b = floor(texelFetch(level, ivec2(x1, y0), 0).rgb * 255.0 + 0.5);
+    vec3 c = floor(texelFetch(level, ivec2(x0, y1), 0).rgb * 255.0 + 0.5);
+    vec3 d = floor(texelFetch(level, ivec2(x1, y1), 0).rgb * 255.0 + 0.5);
+    vec3 top = a + (b - a) * t.x;
+    vec3 under = c + (d - c) * t.x;
+    return top + (under - top) * t.y;
+}
+
+uint glass_grain(int x, int y)
+{
+    uint h = uint(x) * 374761393u + uint(y) * 668265263u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h ^= h >> 16u;
+    return h & 65535u;
+}
+
 void main()
 {
     uint mode = mode_rgba[0].x;
@@ -101,6 +159,36 @@ void main()
     vec2 centre = floor(at) + 0.5;
     vec4 c;
 
+    if (mode == GLASS) {
+        vec2 n;
+        vec2 p = centre;
+        float d = glass_distance(p, n);
+        if (d >= 0.5) {
+            discard;
+        }
+        float a = floor(min(0.5 - d, 1.0) * float(mode_rgba[0].y) + 0.5);
+        if (a <= 0.0) {
+            discard;
+        }
+        float band_width = band.z > 0.0 ? band.z : (band.y > 0.0 ? band.y : 1.0);
+        float e = clamp(1.0 + d / band_width, 0.0, 1.0);
+        float fe = e * e;
+        vec2 s = p - n * band.y * fe;
+        vec3 g = glass_sample(source, (s - abcd.zw) / 2.0 - 0.5);
+        if (mode_rgba[0].z != 0u && band.x < 1.0) {
+            vec3 crisp = glass_sample(sharp, s - abcd.zw - 0.5);
+            g = crisp + (g - crisp) * band.x;
+        }
+        float luma = 0.2126 * g.r + 0.7152 * g.g + 0.0722 * g.b;
+        g = luma + (g - luma) * band.w;
+        g = g + (vec3(mode_rgba[1].rgb) - g) * (float(mode_rgba[1].a) / 255.0);
+        float lit = 0.5 + 0.5 * dot(n, vec2(-0.6, -0.8));
+        float grain = abcd.y * 0.04 * (float(glass_grain(int(floor(p.x)), int(floor(p.y)))) / 65536.0 - 0.5) * 255.0;
+        g = g + abcd.x * 255.0 + win.rgb * (win.a / 255.0) * fe * lit + grain;
+        vec3 out_rgb = clamp(floor(g + 0.5), 0.0, 255.0) / 255.0;
+        color = vec4(hdr ? linear_light(out_rgb) : out_rgb, a / 255.0);
+        return;
+    }
     if (mode == COPY) {
         color = texelFetch(source, ivec2(centre), 0);
         return;
@@ -146,6 +234,21 @@ void main()
             discard;
         }
         c = vec4(rgba.rgb, float(a) / 255.0);
+    } else if (mode == GRADIENT) {
+        // The ramp (bound as the source, 256 x 1) at the position of this pixel centre along the gradient, nearest, as Velvet
+        // reads it; band: kind (0 linear, 1 radial), spread (0 pad, 1 repeat, 2 reflect).
+        float u = abcd.x * centre.x + abcd.z * centre.y + efwh.x;
+        float v = abcd.y * centre.x + abcd.w * centre.y + efwh.y;
+        float t = band.x < 0.5 ? u : length(vec2(u, v));
+        if (band.y < 0.5) {
+            t = clamp(t, 0.0, 1.0);
+        } else if (band.y < 1.5) {
+            t = t - floor(t);
+        } else {
+            float m = t - 2.0 * floor(t / 2.0);
+            t = m > 1.0 ? 2.0 - m : m;
+        }
+        c = texelFetch(source, ivec2(int(floor(t * 255.0 + 0.5)), 0), 0);
     } else if (mode == GLYPH) {
         // The atlas, bound as the source (single channel), under the texel, nearest.
         uint cv = uint(round(texelFetch(source, ivec2(floor(atlas_at)), 0).r * 255.0));
@@ -177,6 +280,18 @@ void main()
         if (!(u >= 0.0 && u < w && v >= 0.0 && v < h)) {
             discard;
         }
+        // the window crops; the pixels beside it are still read by the smooth filter
+        if (band.y > 0.5 && !(u >= win.x && u < win.z && v >= win.y && v < win.w)) {
+            discard;
+        }
+        // rounded corners: the coverage of the rounded box, as ROUND draws it; rgba is the tint
+        float cover = 1.0;
+        if (band.x > 0.5) {
+            cover = roundbox(centre, shape, radii, band.z < 2.0);
+            if (cover <= 0.0) {
+                discard;
+            }
+        }
         if (hdr) {
             // In floats: nearest, or bilinear weighed by alpha.
             vec4 f;
@@ -200,8 +315,10 @@ void main()
                 }
                 f = vec4(m.rgb / m.a, m.a);
             }
-            vec3 light = (mode_rgba[0].w & 2u) != 0u ? f.rgb : linear_light(f.rgb);
-            color = vec4(light, f.a * float(mode_rgba[0].y) / 255.0);
+            // the tint multiplies the source's own values, as they are stored
+            vec3 tinted = f.rgb * rgba.rgb;
+            vec3 light = (mode_rgba[0].w & 2u) != 0u ? tinted : linear_light(tinted);
+            color = vec4(light, f.a * rgba.a * float(mode_rgba[0].y) / 255.0 * cover);
             return;
         }
         uvec4 s;
@@ -236,8 +353,10 @@ void main()
             uint half_sum = sum / 2u;
             s = uvec4((rgb + half_sum) / sum, (sum + 32768u) >> 16);
         }
+        // Velvet's order: the tint (alpha too), then the opacity, then the coverage, each (x × y + 127) / 255
+        s = uvec4((s.xyz * mode_rgba[1].xyz + 127u) / 255u, (s.w * mode_rgba[1].w + 127u) / 255u);
         uint a = (s.w * mode_rgba[0].y + 127u) / 255u;
-        c = vec4(vec3(s.xyz) / 255.0, float(a) / 255.0);
+        c = vec4(vec3(s.xyz) / 255.0, band.x > 0.5 ? shaped(a, cover) : float(a) / 255.0);
     }
     if (hdr) {
         c.rgb = linear_light(c.rgb);

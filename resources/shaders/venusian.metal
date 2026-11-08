@@ -4,7 +4,7 @@ using namespace metal;
 struct PointIn { float2 point [[attribute(0)]]; float2 texel [[attribute(1)]]; };
 struct VOut { float4 position [[position]]; float2 at; float2 atlas_at; };
 struct Frame { float4 size; };
-struct Paint { uint4 mode_rgba[2]; float4 shape; float4 band; float4 abcd; float4 efwh; float4 radii; };
+struct Paint { uint4 mode_rgba[2]; float4 shape; float4 band; float4 abcd; float4 efwh; float4 radii; float4 win; };
 
 constant uint SOLID = 0;
 constant uint FILL = 1;
@@ -14,6 +14,8 @@ constant uint COPY = 4;
 constant uint ROUND = 5;
 constant uint SHADE = 6;
 constant uint GLYPH = 7;
+constant uint GRADIENT = 8;
+constant uint GLASS = 9;
 
 vertex VOut place(PointIn in [[stage_in]], constant Frame &frame [[buffer(0)]])
 {
@@ -86,7 +88,52 @@ static float3 linear_light(float3 c)
 
 // As venusian.frag: flags bit 1 an HDR target (sRGB decoded to linear light,
 // SDR white 1.0), bit 2 a half-float source (linear already).
-fragment float4 paint(VOut in [[stage_in]], constant Paint &p [[buffer(0)]], texture2d<float> source [[texture(0)]], sampler s0 [[sampler(0)]])
+// ---- GLASS: one pane over its box (ext-fb's fb_paint_glass() step for step) ----
+// shape: the box; radii: tl, tr, br, bl; band: frost, refraction, bevel, saturation; abcd: light, grain, the backdrop's x, y;
+// win: the rim colour bytes; mode_rgba[0]: GLASS, the alpha, whether the sharp capture is bound, flags; mode_rgba[1]: the tint.
+// The level is half size (a scale of 2).
+static float glass_distance(float2 pt, constant Paint &p, thread float2 &n)
+{
+    float2 c = (p.shape.xy + p.shape.zw) * 0.5, h = (p.shape.zw - p.shape.xy) * 0.5;
+    float r = pt.x < c.x ? (pt.y < c.y ? p.radii.x : p.radii.w) : (pt.y < c.y ? p.radii.y : p.radii.z);
+    float2 q = abs(pt - c) - (h - r);
+    float d;
+    if (q.x > 0.0 && q.y > 0.0) {
+        float len = length(q);
+        d = len - r;
+        n = q / len;
+    } else if (q.x > q.y) {
+        d = q.x - r;
+        n = float2(1.0, 0.0);
+    } else {
+        d = q.y - r;
+        n = float2(0.0, 1.0);
+    }
+    n *= float2(pt.x < c.x ? -1.0 : 1.0, pt.y < c.y ? -1.0 : 1.0);
+    return d;
+}
+
+static float3 glass_sample(texture2d<float> level, float2 uv)
+{
+    int2 size = int2(level.get_width(), level.get_height());
+    float2 f = floor(uv), t = uv - f;
+    int x0 = clamp(int(f.x), 0, size.x - 1), x1 = clamp(int(f.x) + 1, 0, size.x - 1);
+    int y0 = clamp(int(f.y), 0, size.y - 1), y1 = clamp(int(f.y) + 1, 0, size.y - 1);
+    float3 a = round(level.read(uint2(x0, y0)).rgb * 255.0), b = round(level.read(uint2(x1, y0)).rgb * 255.0);
+    float3 c = round(level.read(uint2(x0, y1)).rgb * 255.0), d = round(level.read(uint2(x1, y1)).rgb * 255.0);
+    float3 top = a + (b - a) * t.x, under = c + (d - c) * t.x;
+    return top + (under - top) * t.y;
+}
+
+static uint glass_grain(int x, int y)
+{
+    uint h = uint(x) * 374761393u + uint(y) * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return h & 0xFFFFu;
+}
+
+fragment float4 paint(VOut in [[stage_in]], constant Paint &p [[buffer(0)]], texture2d<float> source [[texture(0)]], texture2d<float> sharp [[texture(1)]], sampler s0 [[sampler(0)]])
 {
     uint mode = p.mode_rgba[0].x;
     bool hdr = (p.mode_rgba[0].w & 1u) != 0u;
@@ -94,6 +141,34 @@ fragment float4 paint(VOut in [[stage_in]], constant Paint &p [[buffer(0)]], tex
     float2 centre = floor(in.at) + 0.5;
     float4 c;
 
+    if (mode == GLASS) {
+        float2 n;
+        float d = glass_distance(centre, p, n);
+        if (d >= 0.5) {
+            discard_fragment();
+        }
+        float a = floor(min(0.5 - d, 1.0) * float(p.mode_rgba[0].y) + 0.5);
+        if (a <= 0.0) {
+            discard_fragment();
+        }
+        float band_width = p.band.z > 0.0 ? p.band.z : (p.band.y > 0.0 ? p.band.y : 1.0);
+        float e = clamp(1.0 + d / band_width, 0.0, 1.0);
+        float fe = e * e;
+        float2 s = centre - n * p.band.y * fe;
+        float3 g = glass_sample(source, (s - p.abcd.zw) / 2.0 - 0.5);
+        if (p.mode_rgba[0].z != 0u && p.band.x < 1.0) {
+            float3 crisp = glass_sample(sharp, s - p.abcd.zw - 0.5);
+            g = crisp + (g - crisp) * p.band.x;
+        }
+        float luma = 0.2126 * g.r + 0.7152 * g.g + 0.0722 * g.b;
+        g = luma + (g - luma) * p.band.w;
+        g = g + (float3(p.mode_rgba[1].rgb) - g) * (float(p.mode_rgba[1].a) / 255.0);
+        float lit_rim = 0.5 + 0.5 * dot(n, float2(-0.6, -0.8));
+        float grain = p.abcd.y * 0.04 * (float(glass_grain(int(floor(centre.x)), int(floor(centre.y)))) / 65536.0 - 0.5) * 255.0;
+        g = g + p.abcd.x * 255.0 + p.win.rgb * (p.win.a / 255.0) * fe * lit_rim + grain;
+        float3 out_rgb = clamp(floor(g + 0.5), 0.0, 255.0) / 255.0;
+        return float4(hdr ? linear_light(out_rgb) : out_rgb, a / 255.0);
+    }
     if (mode == COPY) {
         return source.read(uint2(centre));
     }
@@ -137,6 +212,20 @@ fragment float4 paint(VOut in [[stage_in]], constant Paint &p [[buffer(0)]], tex
             discard_fragment();
         }
         c = float4(rgba.rgb, float(a) / 255.0);
+    } else if (mode == GRADIENT) {
+        // The ramp (the source, 256 x 1) at the position of this pixel centre along the gradient, nearest; band: kind, spread.
+        float u = p.abcd.x * centre.x + p.abcd.z * centre.y + p.efwh.x;
+        float v = p.abcd.y * centre.x + p.abcd.w * centre.y + p.efwh.y;
+        float t = p.band.x < 0.5 ? u : length(float2(u, v));
+        if (p.band.y < 0.5) {
+            t = clamp(t, 0.0, 1.0);
+        } else if (p.band.y < 1.5) {
+            t = t - floor(t);
+        } else {
+            float m = t - 2.0 * floor(t / 2.0);
+            t = m > 1.0 ? 2.0 - m : m;
+        }
+        c = source.read(uint2(uint(floor(t * 255.0 + 0.5)), 0));
     } else if (mode == GLYPH) {
         uint cv = uint(round(source.read(uint2(floor(in.atlas_at))).r * 255.0));
         uint a = (p.mode_rgba[1].w * cv + 127u) / 255u;
@@ -166,6 +255,18 @@ fragment float4 paint(VOut in [[stage_in]], constant Paint &p [[buffer(0)]], tex
         if (!(u >= 0.0 && u < w && v >= 0.0 && v < h)) {
             discard_fragment();
         }
+        // the window crops; the pixels beside it are still read by the smooth filter
+        if (p.band.y > 0.5 && !(u >= p.win.x && u < p.win.z && v >= p.win.y && v < p.win.w)) {
+            discard_fragment();
+        }
+        // rounded corners: the coverage of the rounded box, as ROUND draws it; rgba is the tint
+        float cover = 1.0;
+        if (p.band.x > 0.5) {
+            cover = roundbox(centre, p.shape, p.radii, p.band.z < 2.0);
+            if (cover <= 0.0) {
+                discard_fragment();
+            }
+        }
         if (hdr) {
             float4 f;
             if (p.mode_rgba[0].z == 0) {
@@ -188,8 +289,10 @@ fragment float4 paint(VOut in [[stage_in]], constant Paint &p [[buffer(0)]], tex
                 }
                 f = float4(m.rgb / m.a, m.a);
             }
-            float3 light = (p.mode_rgba[0].w & 2u) != 0u ? f.rgb : linear_light(f.rgb);
-            return float4(light, f.a * float(p.mode_rgba[0].y) / 255.0);
+            // the tint multiplies the source's own values, as they are stored
+            float3 tinted = f.rgb * rgba.rgb;
+            float3 light = (p.mode_rgba[0].w & 2u) != 0u ? tinted : linear_light(tinted);
+            return float4(light, f.a * rgba.a * float(p.mode_rgba[0].y) / 255.0 * cover);
         }
         uint4 s;
         if (p.mode_rgba[0].z == 0) {
@@ -223,8 +326,10 @@ fragment float4 paint(VOut in [[stage_in]], constant Paint &p [[buffer(0)]], tex
             uint half_sum = sum / 2;
             s = uint4((rgb + half_sum) / sum, (sum + 32768) >> 16);
         }
+        // Velvet's order: the tint (alpha too), then the opacity, then the coverage, each (x × y + 127) / 255
+        s = uint4((s.xyz * p.mode_rgba[1].xyz + 127) / 255, (s.w * p.mode_rgba[1].w + 127) / 255);
         uint a = (s.w * p.mode_rgba[0].y + 127) / 255;
-        c = float4(float3(s.xyz) / 255.0, float(a) / 255.0);
+        c = float4(float3(s.xyz) / 255.0, p.band.x > 0.5 ? shaped(a, cover) : float(a) / 255.0);
     }
     if (hdr) {
         c.rgb = linear_light(c.rgb);
