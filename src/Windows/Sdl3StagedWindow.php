@@ -2,6 +2,7 @@
 
 namespace Jovian\Engines\Sdl3\Windows;
 
+use Surface\HumanInput\Keymaps\EditKeys;
 use Closure;
 use Jovian\Engines\Sdl3\Bridge\Sdl3BridgeDriver;
 use Jovian\Engines\Sdl3\Bridge\Sdl3Session;
@@ -295,6 +296,9 @@ class Sdl3StagedWindow extends StagedWindow
         }
         $printable = $event->key >= 0x20 && $event->key !== 0x7f && $event->key < 0x40000000;
         $this->keyPressed($key, $printable ? mb_chr($event->key) : '', $modifiers, $event->repeat);
+        // SDL has no key bindings: the platform's standard editing keys become edit commands here.
+        $command = EditKeys::command($key, $modifiers);
+        $command === null || $this->editCommanded($command);
     }
 
     public function surfaces(): array
