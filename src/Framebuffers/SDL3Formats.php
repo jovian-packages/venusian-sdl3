@@ -8,7 +8,7 @@ use Surface\Contracts\Rendering\Framebuffers\FormatSpec;
 use Surface\Contracts\Rendering\Framebuffers\FramebufferException;
 use Surface\Contracts\Rendering\Framebuffers\PixelFormat;
 use Surface\Contracts\Rendering\Framebuffers\ScanDirection;
-use Surface\VelvetGE\Framebuffers\Layout;
+use VelvetGE\Framebuffers\Layout;
 
 /**
  * The SDL pixel format whose memory is VelvetGE's bytes for a FormatSpec, byte for byte, on a
