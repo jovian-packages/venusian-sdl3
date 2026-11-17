@@ -87,9 +87,9 @@ for ($x = 4.0; $x <= 96; $x += 4) {
     $y = 50 + 30 * sin($x / 9);
     $x === 4.0 ? $wave->moveTo($x, $y) : $wave->lineTo($x, $y);
 }
-$check('it is the GPU backend only, with every feature, and casts rays', fn () => $sdl->name() === 'sdl3'
+$check('it is the GPU backend only, with every feature but images, and casts rays', fn () => $sdl->name() === 'sdl3'
     && $sdl->backend() === Backend::GPU && $sdl instanceof CastsRays
-    && array_filter(Feature::cases(), fn (Feature $f) => ! $sdl->has($f)) === []);
+    && array_values(array_filter(Feature::cases(), fn (Feature $f) => ! $sdl->has($f))) === [Feature::IMAGES]);
 $check('it refuses the CPU backend', function () {
     try {
         new SDLGPUDevice(Backend::CPU);

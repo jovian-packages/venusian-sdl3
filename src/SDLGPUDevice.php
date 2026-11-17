@@ -126,9 +126,10 @@ class SDLGPUDevice extends SDL3Device implements CastsRays
         return ['gpu' => (string) SDL_GetGPUDeviceDriver($this->gpu)];
     }
 
+    /** Every feature but images: this engine's surfaces do not lend a decoder memory or upload it yet. */
     public function has(Feature $feature): bool
     {
-        return true;
+        return $feature !== Feature::IMAGES;
     }
 
     /**
